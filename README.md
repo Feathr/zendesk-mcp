@@ -200,4 +200,3 @@ Then restart Claude Code.
 - Your API token lives in `~/.claude/mcp-servers/zendesk/.env` on your local machine only (gitignored)
 - Each person uses their own API token, so actions are attributable in Zendesk audit logs
 - Access levels are enforced at the server level — tools that aren't in your level don't exist in the MCP registration
-- The entire server is ~500 lines of Python — easy to read and audit
