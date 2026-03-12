@@ -1,6 +1,6 @@
 # Feathr Zendesk MCP Server
 
-A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk instance. No third-party npm packages, no mystery code — just a single Python file (~500 lines) that calls the Zendesk REST API with three dependencies (`mcp`, `httpx`, `python-dotenv`).
+A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk instance.
 
 ## Access Levels
 
@@ -97,7 +97,7 @@ Then edit `~/.claude/mcp-servers/zendesk/.env` and set `ACCESS_LEVEL` to the val
 
 **For the API key:** Tell the user:
 
-> **To get your Zendesk API key, reach out to Coog (Cris) on Slack.** He'll set you up with a token. Once you have it, update your `.env` file with:
+> **To get your Zendesk API key, reach out to Coog (Cris) on GChat.** He'll set you up with a token. Once you have it, update your `.env` file with:
 > - `ZENDESK_EMAIL` — your `@feathr.co` email
 > - `ZENDESK_API_KEY` — the token Coog gives you
 >
