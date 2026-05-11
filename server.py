@@ -6,13 +6,16 @@ Access levels controlled by ACCESS_LEVEL env var:
     admin      — management + user/org CRUD, merge, bulk ops, delete (21 tools)
 """
 
+import base64
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 # Load .env from the same directory as this script
 load_dotenv(Path(__file__).parent / ".env")
@@ -68,6 +71,113 @@ def _delete(path: str) -> str:
     resp = _client.delete(path)
     resp.raise_for_status()
     return "Deleted successfully."
+
+
+# ---------------------------------------------------------------------------
+# Content helpers
+# ---------------------------------------------------------------------------
+
+
+class _HtmlContentExtractor(HTMLParser):
+    """Extract <a href> and <img src> from a comment's html_body.
+
+    Uses a stack so nested <a> tags (rare but possible in email-quoted threads)
+    don't lose links. Inline <img> sources are collected separately so callers
+    can surface screenshots and email-embedded graphics distinct from links.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.links: list[dict] = []
+        self.images: list[dict] = []
+        self._stack: list[tuple[str | None, list[str]]] = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        if tag == "a":
+            self._stack.append((attrs_dict.get("href"), []))
+        elif tag == "img":
+            src = attrs_dict.get("src")
+            if src:
+                self.images.append({
+                    "src": src,
+                    "alt": (attrs_dict.get("alt") or "").strip(),
+                })
+
+    def handle_startendtag(self, tag, attrs):
+        # Handle self-closing <img/> in XHTML-flavored HTML.
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._stack:
+            href, parts = self._stack.pop()
+            if href:
+                text = "".join(parts).strip()
+                self.links.append({"text": text or href, "url": href})
+
+    def handle_data(self, data):
+        if self._stack:
+            self._stack[-1][1].append(data)
+
+
+def _extract_html_content(html: str) -> dict:
+    """Parse <a> and <img> tags from HTML, deduplicated by URL/src.
+
+    Returns {"links": [{"text", "url"}, ...], "images": [{"src", "alt"}, ...]}.
+    Empty lists on missing/invalid HTML.
+    """
+    if not html:
+        return {"links": [], "images": []}
+    parser = _HtmlContentExtractor()
+    try:
+        parser.feed(html)
+    except Exception:
+        return {"links": [], "images": []}
+
+    seen_urls: set[str] = set()
+    links: list[dict] = []
+    for link in parser.links:
+        if link["url"] not in seen_urls:
+            seen_urls.add(link["url"])
+            links.append(link)
+
+    seen_srcs: set[str] = set()
+    images: list[dict] = []
+    for img in parser.images:
+        if img["src"] not in seen_srcs:
+            seen_srcs.add(img["src"])
+            images.append(img)
+
+    return {"links": links, "images": images}
+
+
+def _project_comment(c: dict) -> dict:
+    """Project a raw Zendesk comment into the MCP response shape.
+
+    Adds extracted `links`, inline `images`, and `attachments` metadata so a
+    single fetch surfaces everything a extractionworkflow typically needs.
+    """
+    content = _extract_html_content(c.get("html_body", ""))
+    return {
+        "id": c["id"],
+        "author_id": c.get("author_id"),
+        "body": c.get("body", ""),
+        "plain_body": c.get("plain_body", ""),
+        "links": content["links"],
+        "images": content["images"],
+        "attachments": [
+            {
+                "id": a["id"],
+                "filename": a.get("file_name", ""),
+                "content_type": a.get("content_type", ""),
+                "size": a.get("size", 0),
+                "url": a.get("content_url", ""),
+            }
+            for a in c.get("attachments", [])
+        ],
+        "public": c.get("public", True),
+        "created_at": c.get("created_at", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -132,18 +242,18 @@ def get_ticket(ticket_id: int) -> str:
 
 @mcp.tool()
 def get_ticket_comments(ticket_id: int) -> str:
-    """Get all comments (replies) on a Zendesk ticket, in chronological order."""
+    """Get all comments (replies) on a Zendesk ticket, in chronological order.
+
+    Each comment includes:
+    - `links`: anchor URLs extracted from html_body (recovers triage URLs that
+      the markdown body flattens to plain text).
+    - `images`: inline <img src> URLs and alt text.
+    - `attachments`: filename, url, content_type, size for each attachment.
+
+    To fetch attachment content, use `fetch_attachment(url)`.
+    """
     data = _get(f"/tickets/{ticket_id}/comments.json")
-    comments = []
-    for c in data.get("comments", []):
-        comments.append({
-            "id": c["id"],
-            "author_id": c.get("author_id"),
-            "body": c.get("body", ""),
-            "plain_body": c.get("plain_body", ""),
-            "public": c.get("public", True),
-            "created_at": c.get("created_at", ""),
-        })
+    comments = [_project_comment(c) for c in data.get("comments", [])]
     return json.dumps(comments, indent=2)
 
 
@@ -220,6 +330,151 @@ def list_views() -> str:
             "active": v.get("active", True),
         })
     return json.dumps(views, indent=2)
+
+
+@mcp.tool()
+def get_ticket_audits(ticket_id: int) -> str:
+    """Get the audit log for a ticket — field changes, notifications, etc.
+
+    Returns events in chronological order. Comment/VoiceComment events are
+    skipped (use get_ticket_comments for those); only Change and Notification
+    events are included so the audit log stays focused on "who changed what
+    when" — useful for stale-ticket triage and SLA investigations.
+    """
+    data = _get(f"/tickets/{ticket_id}/audits.json")
+    audits = []
+    for a in data.get("audits", []):
+        events = []
+        for e in a.get("events", []):
+            etype = e.get("type")
+            if etype == "Change":
+                events.append({
+                    "type": "Change",
+                    "field": e.get("field_name"),
+                    "previous_value": e.get("previous_value"),
+                    "value": e.get("value"),
+                })
+            elif etype == "Notification":
+                events.append({
+                    "type": "Notification",
+                    "recipients": e.get("recipients", []),
+                    "subject": e.get("subject", ""),
+                })
+        if events:
+            audits.append({
+                "id": a["id"],
+                "author_id": a.get("author_id"),
+                "created_at": a.get("created_at", ""),
+                "events": events,
+            })
+    return json.dumps(audits, indent=2)
+
+
+@mcp.tool()
+def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) -> str:
+    """Bulk-fetch comments for many tickets in parallel.
+
+    Speeds up running per-ticket analysis (e.g. auto-block) across an entire
+    view: fetches up to `max_concurrency` ticket comment threads concurrently
+    and returns a dict keyed by ticket_id, with the same per-comment shape as
+    `get_ticket_comments` (links, images, attachments included).
+
+    Args:
+        ticket_ids: List of ticket IDs to fetch (max 200).
+        max_concurrency: Maximum simultaneous Zendesk requests (1–20, default 8).
+    """
+    if len(ticket_ids) > 200:
+        return json.dumps({"error": "Maximum 200 tickets per bulk fetch."})
+
+    workers = max(1, min(max_concurrency, 20))
+
+    def fetch_one(tid: int) -> tuple[int, list]:
+        data = _get(f"/tickets/{tid}/comments.json")
+        return tid, [_project_comment(c) for c in data.get("comments", [])]
+
+    results: dict[str, list] = {}
+    errors: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(fetch_one, tid): tid for tid in ticket_ids}
+        for fut in as_completed(futures):
+            tid = futures[fut]
+            try:
+                tid_back, comments = fut.result()
+                results[str(tid_back)] = comments
+            except Exception as exc:
+                errors[str(tid)] = str(exc)
+
+    out: dict = {"comments_by_ticket": results}
+    if errors:
+        out["errors"] = errors
+    return json.dumps(out, indent=2)
+
+
+@mcp.tool()
+def fetch_attachment(url: str, max_size_mb: int = 10):
+    """Fetch the contents of a Zendesk attachment by URL.
+
+    For images, returns inline image content the model can view directly.
+    For text-like content (text/*, JSON, CSV, XML), returns decoded text.
+    For other binary types, returns metadata only — no base64 dump, since
+    that bloats context without giving the model anything actionable.
+
+    Refuses URLs not on the configured Zendesk subdomain to prevent the
+    auth-bearing client from being pointed at arbitrary hosts.
+
+    Args:
+        url: Attachment URL (typically from get_ticket_comments → attachments[*].url).
+        max_size_mb: Refuse to fetch attachments larger than this (default 10).
+    """
+    expected_host = f"{SUBDOMAIN}.zendesk.com"
+    if expected_host not in url:
+        return json.dumps({
+            "error": f"URL is not on the configured Zendesk subdomain ({expected_host}).",
+        })
+
+    resp = httpx.get(
+        url,
+        auth=(f"{EMAIL}/token", API_KEY),
+        timeout=60.0,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+
+    content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+    size = len(resp.content)
+    max_bytes = max_size_mb * 1024 * 1024
+
+    if size > max_bytes:
+        return json.dumps({
+            "kind": "too_large",
+            "size_bytes": size,
+            "max_bytes": max_bytes,
+            "content_type": content_type,
+        })
+
+    if content_type.startswith("image/"):
+        fmt = content_type.removeprefix("image/").split("+")[0] or "png"
+        return Image(data=resp.content, format=fmt)
+
+    text_like = (
+        content_type.startswith("text/")
+        or content_type in ("application/json", "application/xml")
+        or "csv" in content_type
+        or "json" in content_type
+    )
+    if text_like:
+        try:
+            return resp.text
+        except UnicodeDecodeError:
+            pass
+
+    return json.dumps({
+        "kind": "binary",
+        "content_type": content_type,
+        "size_bytes": size,
+        "message": "Binary content not returned. Download externally if needed.",
+        "preview_b64_first_64": base64.b64encode(resp.content[:64]).decode("ascii"),
+    })
 
 
 # ---------------------------------------------------------------------------
