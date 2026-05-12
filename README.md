@@ -198,6 +198,17 @@ git pull
 
 Then restart Claude Code.
 
+## Development
+
+This project uses [ruff](https://docs.astral.sh/ruff/) for linting and formatting. The ruleset lives in `pyproject.toml` and mirrors anhinga's config (line-length 100, target Python 3.10, `B`/`I`/`E` rules, max-complexity 10).
+
+```bash
+uvx ruff check .   # lint
+uvx ruff format .  # format
+```
+
+Run both before opening a PR.
+
 ## Security
 
 - Your API token lives in `~/.claude/mcp-servers/zendesk/.env` on your local machine only (gitignored)
