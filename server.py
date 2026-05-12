@@ -26,7 +26,9 @@ API_KEY = os.environ["ZENDESK_API_KEY"]
 ACCESS_LEVEL = os.environ.get("ACCESS_LEVEL", "readonly").lower()
 
 if ACCESS_LEVEL not in ("readonly", "management", "admin"):
-    raise ValueError(f"Invalid ACCESS_LEVEL: {ACCESS_LEVEL!r}. Must be readonly, management, or admin.")
+    raise ValueError(
+        f"Invalid ACCESS_LEVEL: {ACCESS_LEVEL!r}. Must be readonly, management, or admin."
+    )
 
 BASE_URL = f"https://{SUBDOMAIN}.zendesk.com/api/v2"
 
@@ -99,10 +101,12 @@ class _HtmlContentExtractor(HTMLParser):
         elif tag == "img":
             src = attrs_dict.get("src")
             if src:
-                self.images.append({
-                    "src": src,
-                    "alt": (attrs_dict.get("alt") or "").strip(),
-                })
+                self.images.append(
+                    {
+                        "src": src,
+                        "alt": (attrs_dict.get("alt") or "").strip(),
+                    }
+                )
 
     def handle_startendtag(self, tag, attrs):
         # Handle self-closing <img/> in XHTML-flavored HTML.
@@ -202,17 +206,19 @@ def search_tickets(query: str) -> str:
         return "No tickets found."
     tickets = []
     for t in results:
-        tickets.append({
-            "id": t["id"],
-            "subject": t.get("subject", ""),
-            "status": t.get("status", ""),
-            "priority": t.get("priority", ""),
-            "created_at": t.get("created_at", ""),
-            "updated_at": t.get("updated_at", ""),
-            "assignee_id": t.get("assignee_id"),
-            "requester_id": t.get("requester_id"),
-            "tags": t.get("tags", []),
-        })
+        tickets.append(
+            {
+                "id": t["id"],
+                "subject": t.get("subject", ""),
+                "status": t.get("status", ""),
+                "priority": t.get("priority", ""),
+                "created_at": t.get("created_at", ""),
+                "updated_at": t.get("updated_at", ""),
+                "assignee_id": t.get("assignee_id"),
+                "requester_id": t.get("requester_id"),
+                "tags": t.get("tags", []),
+            }
+        )
     return json.dumps(tickets, indent=2)
 
 
@@ -286,13 +292,15 @@ def search_users(query: str) -> str:
     data = _get("/users/search.json", params={"query": query})
     users = []
     for u in data.get("users", []):
-        users.append({
-            "id": u["id"],
-            "name": u.get("name", ""),
-            "email": u.get("email", ""),
-            "role": u.get("role", ""),
-            "organization_id": u.get("organization_id"),
-        })
+        users.append(
+            {
+                "id": u["id"],
+                "name": u.get("name", ""),
+                "email": u.get("email", ""),
+                "role": u.get("role", ""),
+                "organization_id": u.get("organization_id"),
+            }
+        )
     return json.dumps(users, indent=2)
 
 
@@ -306,15 +314,17 @@ def get_view_tickets(view_id: int) -> str:
     data = _get(f"/views/{view_id}/tickets.json")
     tickets = []
     for t in data.get("tickets", []):
-        tickets.append({
-            "id": t["id"],
-            "subject": t.get("subject", ""),
-            "status": t.get("status", ""),
-            "priority": t.get("priority", ""),
-            "requester_id": t.get("requester_id"),
-            "assignee_id": t.get("assignee_id"),
-            "updated_at": t.get("updated_at", ""),
-        })
+        tickets.append(
+            {
+                "id": t["id"],
+                "subject": t.get("subject", ""),
+                "status": t.get("status", ""),
+                "priority": t.get("priority", ""),
+                "requester_id": t.get("requester_id"),
+                "assignee_id": t.get("assignee_id"),
+                "updated_at": t.get("updated_at", ""),
+            }
+        )
     return json.dumps(tickets, indent=2)
 
 
@@ -324,11 +334,13 @@ def list_views() -> str:
     data = _get("/views.json")
     views = []
     for v in data.get("views", []):
-        views.append({
-            "id": v["id"],
-            "title": v.get("title", ""),
-            "active": v.get("active", True),
-        })
+        views.append(
+            {
+                "id": v["id"],
+                "title": v.get("title", ""),
+                "active": v.get("active", True),
+            }
+        )
     return json.dumps(views, indent=2)
 
 
@@ -348,25 +360,31 @@ def get_ticket_audits(ticket_id: int) -> str:
         for e in a.get("events", []):
             etype = e.get("type")
             if etype == "Change":
-                events.append({
-                    "type": "Change",
-                    "field": e.get("field_name"),
-                    "previous_value": e.get("previous_value"),
-                    "value": e.get("value"),
-                })
+                events.append(
+                    {
+                        "type": "Change",
+                        "field": e.get("field_name"),
+                        "previous_value": e.get("previous_value"),
+                        "value": e.get("value"),
+                    }
+                )
             elif etype == "Notification":
-                events.append({
-                    "type": "Notification",
-                    "recipients": e.get("recipients", []),
-                    "subject": e.get("subject", ""),
-                })
+                events.append(
+                    {
+                        "type": "Notification",
+                        "recipients": e.get("recipients", []),
+                        "subject": e.get("subject", ""),
+                    }
+                )
         if events:
-            audits.append({
-                "id": a["id"],
-                "author_id": a.get("author_id"),
-                "created_at": a.get("created_at", ""),
-                "events": events,
-            })
+            audits.append(
+                {
+                    "id": a["id"],
+                    "author_id": a.get("author_id"),
+                    "created_at": a.get("created_at", ""),
+                    "events": events,
+                }
+            )
     return json.dumps(audits, indent=2)
 
 
@@ -428,9 +446,11 @@ def fetch_attachment(url: str, max_size_mb: int = 10):
     """
     expected_host = f"{SUBDOMAIN}.zendesk.com"
     if expected_host not in url:
-        return json.dumps({
-            "error": f"URL is not on the configured Zendesk subdomain ({expected_host}).",
-        })
+        return json.dumps(
+            {
+                "error": f"URL is not on the configured Zendesk subdomain ({expected_host}).",
+            }
+        )
 
     resp = httpx.get(
         url,
@@ -445,12 +465,14 @@ def fetch_attachment(url: str, max_size_mb: int = 10):
     max_bytes = max_size_mb * 1024 * 1024
 
     if size > max_bytes:
-        return json.dumps({
-            "kind": "too_large",
-            "size_bytes": size,
-            "max_bytes": max_bytes,
-            "content_type": content_type,
-        })
+        return json.dumps(
+            {
+                "kind": "too_large",
+                "size_bytes": size,
+                "max_bytes": max_bytes,
+                "content_type": content_type,
+            }
+        )
 
     if content_type.startswith("image/"):
         fmt = content_type.removeprefix("image/").split("+")[0] or "png"
@@ -468,13 +490,15 @@ def fetch_attachment(url: str, max_size_mb: int = 10):
         except UnicodeDecodeError:
             pass
 
-    return json.dumps({
-        "kind": "binary",
-        "content_type": content_type,
-        "size_bytes": size,
-        "message": "Binary content not returned. Download externally if needed.",
-        "preview_b64_first_64": base64.b64encode(resp.content[:64]).decode("ascii"),
-    })
+    return json.dumps(
+        {
+            "kind": "binary",
+            "content_type": content_type,
+            "size_bytes": size,
+            "message": "Binary content not returned. Download externally if needed.",
+            "preview_b64_first_64": base64.b64encode(resp.content[:64]).decode("ascii"),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -577,13 +601,16 @@ if ACCESS_LEVEL in ("management", "admin"):
 
         data = _put(f"/tickets/{ticket_id}.json", {"ticket": ticket})
         t = data["ticket"]
-        return json.dumps({
-            "id": t["id"],
-            "status": t["status"],
-            "priority": t.get("priority"),
-            "assignee_id": t.get("assignee_id"),
-            "tags": t.get("tags", []),
-        }, indent=2)
+        return json.dumps(
+            {
+                "id": t["id"],
+                "status": t["status"],
+                "priority": t.get("priority"),
+                "assignee_id": t.get("assignee_id"),
+                "tags": t.get("tags", []),
+            },
+            indent=2,
+        )
 
     @mcp.tool()
     def add_ticket_comment(
@@ -598,17 +625,23 @@ if ACCESS_LEVEL in ("management", "admin"):
             body: The comment text.
             public: True for a public reply (visible to requester), False for an internal note.
         """
-        data = _put(f"/tickets/{ticket_id}.json", {
-            "ticket": {
-                "comment": {"body": body, "public": public},
-            }
-        })
-        return json.dumps({
-            "ticket_id": data["ticket"]["id"],
-            "status": data["ticket"]["status"],
-            "comment_added": True,
-            "public": public,
-        }, indent=2)
+        data = _put(
+            f"/tickets/{ticket_id}.json",
+            {
+                "ticket": {
+                    "comment": {"body": body, "public": public},
+                }
+            },
+        )
+        return json.dumps(
+            {
+                "ticket_id": data["ticket"]["id"],
+                "status": data["ticket"]["status"],
+                "comment_added": True,
+                "public": public,
+            },
+            indent=2,
+        )
 
     @mcp.tool()
     def add_ticket_tags(ticket_id: int, tags: list[str]) -> str:
@@ -655,14 +688,20 @@ if ACCESS_LEVEL == "admin":
             target_ticket_id: The ticket that will remain open and receive merged content.
             source_ticket_ids: Ticket IDs to merge into the target.
         """
-        data = _post(f"/tickets/{target_ticket_id}/merge.json", {
-            "ids": source_ticket_ids,
-        })
-        return json.dumps({
-            "target_ticket_id": target_ticket_id,
-            "merged_ticket_ids": source_ticket_ids,
-            "status": data.get("job_status", {}).get("status", "queued"),
-        }, indent=2)
+        data = _post(
+            f"/tickets/{target_ticket_id}/merge.json",
+            {
+                "ids": source_ticket_ids,
+            },
+        )
+        return json.dumps(
+            {
+                "target_ticket_id": target_ticket_id,
+                "merged_ticket_ids": source_ticket_ids,
+                "status": data.get("job_status", {}).get("status", "queued"),
+            },
+            indent=2,
+        )
 
     @mcp.tool()
     def create_user(
@@ -689,9 +728,15 @@ if ACCESS_LEVEL == "admin":
 
         data = _post("/users.json", {"user": user})
         u = data["user"]
-        return json.dumps({
-            "id": u["id"], "name": u["name"], "email": u["email"], "role": u["role"],
-        }, indent=2)
+        return json.dumps(
+            {
+                "id": u["id"],
+                "name": u["name"],
+                "email": u["email"],
+                "role": u["role"],
+            },
+            indent=2,
+        )
 
     @mcp.tool()
     def update_user(
@@ -729,24 +774,33 @@ if ACCESS_LEVEL == "admin":
 
         data = _put(f"/users/{user_id}.json", {"user": user})
         u = data["user"]
-        return json.dumps({
-            "id": u["id"], "name": u["name"], "email": u["email"], "role": u["role"],
-            "tags": u.get("tags", []),
-        }, indent=2)
+        return json.dumps(
+            {
+                "id": u["id"],
+                "name": u["name"],
+                "email": u["email"],
+                "role": u["role"],
+                "tags": u.get("tags", []),
+            },
+            indent=2,
+        )
 
     @mcp.tool()
     def get_organization(organization_id: int) -> str:
         """Get details for a Zendesk organization by ID."""
         data = _get(f"/organizations/{organization_id}.json")
         o = data["organization"]
-        return json.dumps({
-            "id": o["id"],
-            "name": o.get("name", ""),
-            "domain_names": o.get("domain_names", []),
-            "tags": o.get("tags", []),
-            "group_id": o.get("group_id"),
-            "created_at": o.get("created_at", ""),
-        }, indent=2)
+        return json.dumps(
+            {
+                "id": o["id"],
+                "name": o.get("name", ""),
+                "domain_names": o.get("domain_names", []),
+                "tags": o.get("tags", []),
+                "group_id": o.get("group_id"),
+                "created_at": o.get("created_at", ""),
+            },
+            indent=2,
+        )
 
     @mcp.tool()
     def search_organizations(query: str) -> str:
@@ -758,12 +812,14 @@ if ACCESS_LEVEL == "admin":
         data = _get("/organizations/search.json", params={"name": query})
         orgs = []
         for o in data.get("organizations", []):
-            orgs.append({
-                "id": o["id"],
-                "name": o.get("name", ""),
-                "domain_names": o.get("domain_names", []),
-                "tags": o.get("tags", []),
-            })
+            orgs.append(
+                {
+                    "id": o["id"],
+                    "name": o.get("name", ""),
+                    "domain_names": o.get("domain_names", []),
+                    "tags": o.get("tags", []),
+                }
+            )
         return json.dumps(orgs, indent=2)
 
     @mcp.tool()
@@ -787,9 +843,14 @@ if ACCESS_LEVEL == "admin":
 
         data = _post("/organizations.json", {"organization": org})
         o = data["organization"]
-        return json.dumps({
-            "id": o["id"], "name": o["name"], "domain_names": o.get("domain_names", []),
-        }, indent=2)
+        return json.dumps(
+            {
+                "id": o["id"],
+                "name": o["name"],
+                "domain_names": o.get("domain_names", []),
+            },
+            indent=2,
+        )
 
     @mcp.tool()
     def update_organization(
@@ -819,10 +880,15 @@ if ACCESS_LEVEL == "admin":
 
         data = _put(f"/organizations/{organization_id}.json", {"organization": org})
         o = data["organization"]
-        return json.dumps({
-            "id": o["id"], "name": o["name"],
-            "domain_names": o.get("domain_names", []), "tags": o.get("tags", []),
-        }, indent=2)
+        return json.dumps(
+            {
+                "id": o["id"],
+                "name": o["name"],
+                "domain_names": o.get("domain_names", []),
+                "tags": o.get("tags", []),
+            },
+            indent=2,
+        )
 
     @mcp.tool()
     def delete_ticket(ticket_id: int) -> str:
@@ -872,10 +938,13 @@ if ACCESS_LEVEL == "admin":
 
         ids_str = ",".join(str(i) for i in ticket_ids)
         data = _put(f"/tickets/update_many.json?ids={ids_str}", {"ticket": ticket})
-        return json.dumps({
-            "updated_count": len(ticket_ids),
-            "job_status": data.get("job_status", {}).get("status", "queued"),
-        }, indent=2)
+        return json.dumps(
+            {
+                "updated_count": len(ticket_ids),
+                "job_status": data.get("job_status", {}).get("status", "queued"),
+            },
+            indent=2,
+        )
 
 
 if __name__ == "__main__":
