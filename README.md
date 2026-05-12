@@ -6,16 +6,19 @@ A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk
 
 | Level | Tools | Who should use it |
 |-------|-------|-------------------|
-| **readonly** | Search/read tickets, users, views, orgs (7 tools) | Everyone |
-| **management** | readonly + create/update tickets, comments, tags (12 tools) | Team leads, support agents |
-| **admin** | management + user/org CRUD, merge, bulk ops, delete (21 tools) | Zendesk admins only |
+| **readonly** | Search/read tickets, users, views, orgs, audits, bulk reads, attachments (10 tools) | Everyone |
+| **management** | readonly + create/update tickets, comments, tags (15 tools) | Team leads, support agents |
+| **admin** | management + user/org CRUD, merge, bulk ops, delete (24 tools) | Zendesk admins only |
 
 ## Available Tools
 
 ### Read-Only (all levels)
 - `search_tickets` — Search tickets using Zendesk query syntax
 - `get_ticket` — Get full ticket details by ID
-- `get_ticket_comments` — Get all comments/replies on a ticket
+- `get_ticket_comments` — Get all comments/replies on a ticket (with extracted links, images, and attachment metadata)
+- `get_ticket_audits` — Audit log for a ticket (Change/Notification events, paginated)
+- `get_comments_for_tickets` — Bulk-fetch comments for many tickets in parallel
+- `fetch_attachment` — Fetch an attachment's contents (image/text inline, binary metadata-only)
 - `get_user` — Look up a user by ID
 - `search_users` — Search users by name or email
 - `get_view_tickets` — Execute a saved view and return its tickets

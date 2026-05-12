@@ -1,0 +1,35 @@
+[project]
+name = "zendesk-mcp"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp[cli]>=1.0.0",
+  "httpx>=0.27.0",
+  "python-dotenv>=1.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [".git", ".venv"]
+
+[tool.ruff.lint]
+ignore = [
+  "E203",
+  "E701",
+]
+extend-select = ["B", "I", "E"]
+fixable = ["ALL"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+default-section = "third-party"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 119
+
+[tool.ruff.format]
+docstring-code-line-length = 119
