@@ -1,17 +1,19 @@
 """Zendesk MCP Server — ticket triage, management, and admin.
 
 Access levels controlled by ACCESS_LEVEL env var:
-    readonly   — search/read tickets, users, views, orgs (7 tools)
-    management — readonly + create/update tickets, comments, tags (12 tools)
-    admin      — management + user/org CRUD, merge, bulk ops, delete (21 tools)
+    readonly   — search/read tickets, users, views, orgs, audits, bulk read, attachments (10 tools)
+    management — readonly + create/update tickets, comments, tags (15 tools)
+    admin      — management + user/org CRUD, merge, bulk ops, delete (24 tools)
 """
 
 import base64
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -127,6 +129,10 @@ class _HtmlContentExtractor(HTMLParser):
 def _extract_html_content(html: str) -> dict:
     """Parse <a> and <img> tags from HTML, deduplicated by URL/src.
 
+    For repeated URLs (signature + main body), keeps the variant with the
+    longest non-empty anchor text, since email threads tend to put short
+    boilerplate text before the actual descriptive label.
+
     Returns {"links": [{"text", "url"}, ...], "images": [{"src", "alt"}, ...]}.
     Empty lists on missing/invalid HTML.
     """
@@ -138,11 +144,16 @@ def _extract_html_content(html: str) -> dict:
     except Exception:
         return {"links": [], "images": []}
 
-    seen_urls: set[str] = set()
     links: list[dict] = []
+    url_to_idx: dict[str, int] = {}
     for link in parser.links:
-        if link["url"] not in seen_urls:
-            seen_urls.add(link["url"])
+        url = link["url"]
+        if url in url_to_idx:
+            existing = links[url_to_idx[url]]
+            if len(link["text"]) > len(existing["text"]):
+                links[url_to_idx[url]] = link
+        else:
+            url_to_idx[url] = len(links)
             links.append(link)
 
     seen_srcs: set[str] = set()
@@ -159,7 +170,7 @@ def _project_comment(c: dict) -> dict:
     """Project a raw Zendesk comment into the MCP response shape.
 
     Adds extracted `links`, inline `images`, and `attachments` metadata so a
-    single fetch surfaces everything a extractionworkflow typically needs.
+    single fetch surfaces everything an extraction workflow typically needs.
     """
     content = _extract_html_content(c.get("html_body", ""))
     return {
@@ -250,6 +261,9 @@ def get_ticket(ticket_id: int) -> str:
 def get_ticket_comments(ticket_id: int) -> str:
     """Get all comments (replies) on a Zendesk ticket, in chronological order.
 
+    Follows Zendesk's `next_page` pagination so long threads (>100 comments)
+    are returned in full.
+
     Each comment includes:
     - `links`: anchor URLs extracted from html_body (recovers triage URLs that
       the markdown body flattens to plain text).
@@ -258,8 +272,12 @@ def get_ticket_comments(ticket_id: int) -> str:
 
     To fetch attachment content, use `fetch_attachment(url)`.
     """
-    data = _get(f"/tickets/{ticket_id}/comments.json")
-    comments = [_project_comment(c) for c in data.get("comments", [])]
+    comments: list = []
+    url: str | None = f"/tickets/{ticket_id}/comments.json"
+    while url:
+        data = _get(url)
+        comments.extend(_project_comment(c) for c in data.get("comments", []))
+        url = data.get("next_page")
     return json.dumps(comments, indent=2)
 
 
@@ -348,54 +366,97 @@ def list_views() -> str:
 def get_ticket_audits(ticket_id: int) -> str:
     """Get the audit log for a ticket — field changes, notifications, etc.
 
-    Returns events in chronological order. Comment/VoiceComment events are
-    skipped (use get_ticket_comments for those); only Change and Notification
-    events are included so the audit log stays focused on "who changed what
-    when" — useful for stale-ticket triage and SLA investigations.
+    Follows Zendesk's `next_page` pagination so busy tickets return their
+    full audit history.
+
+    Returns events in chronological order. Comment and VoiceComment events
+    are skipped (use get_ticket_comments for those). Change and Notification
+    events are fully projected; any other event types are surfaced as
+    `{"type": etype}` stubs so callers can see something happened without
+    having to refetch the raw audits endpoint.
     """
-    data = _get(f"/tickets/{ticket_id}/audits.json")
-    audits = []
-    for a in data.get("audits", []):
-        events = []
-        for e in a.get("events", []):
-            etype = e.get("type")
-            if etype == "Change":
-                events.append(
+    audits: list = []
+    url: str | None = f"/tickets/{ticket_id}/audits.json"
+    while url:
+        data = _get(url)
+        for a in data.get("audits", []):
+            events = []
+            for e in a.get("events", []):
+                etype = e.get("type")
+                if etype == "Change":
+                    events.append(
+                        {
+                            "type": "Change",
+                            "field": e.get("field_name"),
+                            "previous_value": e.get("previous_value"),
+                            "value": e.get("value"),
+                        }
+                    )
+                elif etype == "Notification":
+                    events.append(
+                        {
+                            "type": "Notification",
+                            "recipients": e.get("recipients", []),
+                            "subject": e.get("subject", ""),
+                        }
+                    )
+                elif etype in ("Comment", "VoiceComment"):
+                    continue
+                elif etype:
+                    events.append({"type": etype})
+            if events:
+                audits.append(
                     {
-                        "type": "Change",
-                        "field": e.get("field_name"),
-                        "previous_value": e.get("previous_value"),
-                        "value": e.get("value"),
+                        "id": a["id"],
+                        "author_id": a.get("author_id"),
+                        "created_at": a.get("created_at", ""),
+                        "events": events,
                     }
                 )
-            elif etype == "Notification":
-                events.append(
-                    {
-                        "type": "Notification",
-                        "recipients": e.get("recipients", []),
-                        "subject": e.get("subject", ""),
-                    }
-                )
-        if events:
-            audits.append(
-                {
-                    "id": a["id"],
-                    "author_id": a.get("author_id"),
-                    "created_at": a.get("created_at", ""),
-                    "events": events,
-                }
-            )
+        url = data.get("next_page")
     return json.dumps(audits, indent=2)
+
+
+_BULK_FETCH_MAX_RETRIES = 3
+_BULK_FETCH_MAX_BACKOFF_SECONDS = 30
+
+
+def _fetch_comments_with_retry(ticket_id: int) -> list[dict]:
+    """Fetch all comments for one ticket, paginated, with 429 backoff.
+
+    Honors Zendesk's Retry-After header up to a cap; capped retries so a
+    sustained-429 storm fails fast instead of stalling all workers.
+    """
+    comments: list[dict] = []
+    url: str | None = f"/tickets/{ticket_id}/comments.json"
+    while url:
+        for attempt in range(_BULK_FETCH_MAX_RETRIES):
+            resp = _client.get(url)
+            if resp.status_code == 429 and attempt < _BULK_FETCH_MAX_RETRIES - 1:
+                retry_after = resp.headers.get("retry-after", "5")
+                try:
+                    wait = int(retry_after)
+                except ValueError:
+                    wait = 5
+                time.sleep(min(max(wait, 1), _BULK_FETCH_MAX_BACKOFF_SECONDS))
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        comments.extend(_project_comment(c) for c in data.get("comments", []))
+        url = data.get("next_page")
+    return comments
 
 
 @mcp.tool()
 def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) -> str:
     """Bulk-fetch comments for many tickets in parallel.
 
-    Speeds up running per-ticket analysis (e.g. auto-block) across an entire
+    Speeds up per-ticket analysis (e.g. queue-level triage) across an entire
     view: fetches up to `max_concurrency` ticket comment threads concurrently
     and returns a dict keyed by ticket_id, with the same per-comment shape as
-    `get_ticket_comments` (links, images, attachments included).
+    `get_ticket_comments` (links, images, attachments included). Follows
+    pagination per ticket and retries 429s with Retry-After backoff.
 
     Args:
         ticket_ids: List of ticket IDs to fetch (max 200).
@@ -406,19 +467,14 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
 
     workers = max(1, min(max_concurrency, 20))
 
-    def fetch_one(tid: int) -> tuple[int, list]:
-        data = _get(f"/tickets/{tid}/comments.json")
-        return tid, [_project_comment(c) for c in data.get("comments", [])]
-
     results: dict[str, list] = {}
     errors: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(fetch_one, tid): tid for tid in ticket_ids}
+        futures = {ex.submit(_fetch_comments_with_retry, tid): tid for tid in ticket_ids}
         for fut in as_completed(futures):
             tid = futures[fut]
             try:
-                tid_back, comments = fut.result()
-                results[str(tid_back)] = comments
+                results[str(tid)] = fut.result()
             except Exception as exc:
                 errors[str(tid)] = str(exc)
 
@@ -426,6 +482,9 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
     if errors:
         out["errors"] = errors
     return json.dumps(out, indent=2)
+
+
+_IMAGE_FORMAT_ALLOWLIST = {"png", "jpeg", "gif", "webp"}
 
 
 @mcp.tool()
@@ -437,66 +496,111 @@ def fetch_attachment(url: str, max_size_mb: int = 10):
     For other binary types, returns metadata only — no base64 dump, since
     that bloats context without giving the model anything actionable.
 
-    Refuses URLs not on the configured Zendesk subdomain to prevent the
-    auth-bearing client from being pointed at arbitrary hosts.
+    Refuses URLs not on the configured Zendesk subdomain (exact hostname
+    match), to prevent the auth-bearing client from being pointed at
+    arbitrary hosts. Streams the body and enforces `max_size_mb` early so
+    a malicious or oversized response can't exhaust memory. Redirects are
+    not followed; if Zendesk redirects to a CDN, the redirect target is
+    surfaced as a `{kind: "redirect"}` response for the caller to inspect.
 
     Args:
         url: Attachment URL (typically from get_ticket_comments → attachments[*].url).
         max_size_mb: Refuse to fetch attachments larger than this (default 10).
     """
     expected_host = f"{SUBDOMAIN}.zendesk.com"
-    if expected_host not in url:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != expected_host:
         return json.dumps(
             {
                 "error": f"URL is not on the configured Zendesk subdomain ({expected_host}).",
             }
         )
 
-    resp = httpx.get(
+    max_bytes = max_size_mb * 1024 * 1024
+
+    with httpx.stream(
+        "GET",
         url,
         auth=(f"{EMAIL}/token", API_KEY),
         timeout=60.0,
-        follow_redirects=True,
-    )
-    resp.raise_for_status()
+        follow_redirects=False,
+    ) as resp:
+        if resp.is_redirect:
+            return json.dumps(
+                {
+                    "kind": "redirect",
+                    "status_code": resp.status_code,
+                    "location": resp.headers.get("location", ""),
+                    "message": (
+                        "Attachment is served from a redirected location (likely a CDN). "
+                        "Redirects are not followed automatically. Inspect the location "
+                        "and, if you trust it, fetch it via a separate channel."
+                    ),
+                }
+            )
 
-    content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-    size = len(resp.content)
-    max_bytes = max_size_mb * 1024 * 1024
+        resp.raise_for_status()
 
-    if size > max_bytes:
-        return json.dumps(
-            {
-                "kind": "too_large",
-                "size_bytes": size,
-                "max_bytes": max_bytes,
-                "content_type": content_type,
-            }
-        )
+        content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+        declared_length = resp.headers.get("content-length")
+        if declared_length is not None:
+            try:
+                declared_int = int(declared_length)
+            except ValueError:
+                declared_int = 0
+            if declared_int > max_bytes:
+                return json.dumps(
+                    {
+                        "kind": "too_large",
+                        "size_bytes": declared_int,
+                        "max_bytes": max_bytes,
+                        "content_type": content_type,
+                    }
+                )
+
+        buf = bytearray()
+        too_large = False
+        for chunk in resp.iter_bytes():
+            buf.extend(chunk)
+            if len(buf) > max_bytes:
+                too_large = True
+                break
+
+        if too_large:
+            return json.dumps(
+                {
+                    "kind": "too_large",
+                    "size_bytes": len(buf),
+                    "max_bytes": max_bytes,
+                    "content_type": content_type,
+                }
+            )
+
+        content = bytes(buf)
 
     if content_type.startswith("image/"):
-        fmt = content_type.removeprefix("image/").split("+")[0] or "png"
-        return Image(data=resp.content, format=fmt)
+        fmt_raw = content_type.removeprefix("image/").split("+")[0]
+        if fmt_raw == "jpg":
+            fmt_raw = "jpeg"
+        fmt = fmt_raw if fmt_raw in _IMAGE_FORMAT_ALLOWLIST else "png"
+        return Image(data=content, format=fmt)
 
     text_like = (
         content_type.startswith("text/")
-        or content_type in ("application/json", "application/xml")
-        or "csv" in content_type
         or "json" in content_type
+        or "xml" in content_type
+        or "csv" in content_type
     )
     if text_like:
-        try:
-            return resp.text
-        except UnicodeDecodeError:
-            pass
+        return content.decode("utf-8", errors="replace")
 
     return json.dumps(
         {
             "kind": "binary",
             "content_type": content_type,
-            "size_bytes": size,
+            "size_bytes": len(content),
             "message": "Binary content not returned. Download externally if needed.",
-            "preview_b64_first_64": base64.b64encode(resp.content[:64]).decode("ascii"),
+            "preview_b64_first_64": base64.b64encode(content[:64]).decode("ascii"),
         }
     )
 
