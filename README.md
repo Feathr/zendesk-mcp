@@ -101,12 +101,12 @@ Then edit `~/.claude/mcp-servers/zendesk/.env` and set `ACCESS_LEVEL` to the val
 **For the API key:** Tell the user:
 
 > **To get your Zendesk API key, reach out to Coog (Cris) on GChat.** He'll set you up with a token. Once you have it, update your `.env` file with:
-> - `ZENDESK_EMAIL` — your `@feathr.co` email
+> - `ZENDESK_EMAIL` — your **`@feathr.co`** email (e.g. `your.name@feathr.co`). ⚠️ This must be `@feathr.co`, **not** `@feathrapp.com` — Zendesk accounts are registered under `feathr.co` and the `feathrapp.com` variant will fail to authenticate.
 > - `ZENDESK_API_KEY` — the token Coog gives you
 >
 > Let me know when your `.env` file is ready and I'll continue the setup.
 
-**Wait for the user to confirm before proceeding.**
+**Wait for the user to confirm before proceeding.** When they confirm, sanity-check that the `ZENDESK_EMAIL` in their `.env` ends with `@feathr.co` (not `@feathrapp.com`); if it's wrong, ask them to fix it before continuing.
 
 ### Step 4: Verify the server loads
 
@@ -159,6 +159,7 @@ python3 -m venv .venv
 # Configure
 cp .env.example .env
 # Edit .env with your credentials and access level
+# ZENDESK_EMAIL must be your @feathr.co address, NOT @feathrapp.com
 # Contact Coog for your API key
 
 # Verify
@@ -175,7 +176,7 @@ claude mcp add zendesk -s user -- ~/.claude/mcp-servers/zendesk/.venv/bin/python
 - Run `claude mcp list` to verify registration
 
 **Auth errors (401/403)**
-- Verify `.env` values — email must match the Zendesk account
+- `ZENDESK_EMAIL` must be your **`@feathr.co`** address (e.g. `your.name@feathr.co`), **not** `@feathrapp.com`. This is the most common cause of 401s — Zendesk accounts are registered under `feathr.co`.
 - Check the API token for extra whitespace
 - Confirm "Token Access" is enabled in Zendesk Admin > Apps and integrations > Zendesk API
 
