@@ -1,9 +1,9 @@
 """Zendesk MCP Server — ticket triage, management, and admin.
 
 Access levels controlled by ACCESS_LEVEL env var:
-    readonly   — search/read tickets, users, views, orgs, audits, bulk read, attachments (10 tools)
-    management — readonly + create/update tickets, comments, tags (15 tools)
-    admin      — management + user/org CRUD, merge, bulk ops, delete (24 tools)
+    readonly   — search/read/count tickets, users, views, orgs, audits, bulk read, attachments (11 tools)
+    management — readonly + create/update tickets, comments, tags (16 tools)
+    admin      — management + user/org CRUD, merge, bulk ops, delete (25 tools)
 """
 
 import base64
@@ -231,6 +231,23 @@ def search_tickets(query: str) -> str:
             }
         )
     return json.dumps(tickets, indent=2)
+
+
+@mcp.tool()
+def count_tickets(query: str) -> str:
+    """Count Zendesk tickets matching a search query, without returning them.
+
+    Uses the search count endpoint, so it is fast and not subject to the
+    search result limit. Useful for queue-size / backlog checks.
+
+    Examples:
+        count_tickets("tags:escalation status<solved")
+        count_tickets("tags:data_request created>2026-01-01")
+
+    See https://support.zendesk.com/hc/en-us/articles/203663226 for query syntax.
+    """
+    data = _get("/search/count.json", params={"query": f"type:ticket {query}"})
+    return json.dumps({"count": data.get("count", 0)})
 
 
 @mcp.tool()
