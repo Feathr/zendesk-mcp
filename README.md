@@ -202,7 +202,7 @@ Then restart Claude Code.
 
 ## Development
 
-This project uses [ruff](https://docs.astral.sh/ruff/) for linting and formatting. The ruleset lives in `pyproject.toml` and mirrors anhinga's config (line-length 100, target Python 3.10, `B`/`I`/`E` rules, max-complexity 10).
+This project uses [ruff](https://docs.astral.sh/ruff/) for linting and formatting. The ruleset lives in `pyproject.toml` (line-length 100, target Python 3.10, `B`/`I`/`E` rules, max-complexity 10).
 
 ```bash
 uvx ruff check .   # lint
