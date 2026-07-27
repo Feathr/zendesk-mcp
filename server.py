@@ -141,7 +141,7 @@ def _extract_html_content(html: str) -> dict:
     parser = _HtmlContentExtractor()
     try:
         parser.feed(html)
-    except Exception:
+    except Exception:  # noqa: BLE001 — malformed HTML must never break a comment fetch
         return {"links": [], "images": []}
 
     links: list[dict] = []
@@ -571,7 +571,7 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
             tid = futures[fut]
             try:
                 results[str(tid)] = fut.result()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — one failed ticket must not kill the batch
                 errors[str(tid)] = str(exc)
 
     out: dict = {"comments_by_ticket": results}
