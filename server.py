@@ -56,6 +56,34 @@ def _get(path: str, params: dict | None = None) -> dict:
     return resp.json()
 
 
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_MAX_BACKOFF_SECONDS = 30
+
+
+def _get_with_retry(path: str, params: dict | None = None) -> dict:
+    """GET with capped 429 backoff. Honors Zendesk's Retry-After header.
+
+    Sleeps at most _RETRY_MAX_BACKOFF_SECONDS per attempt, with capped
+    attempts so a sustained-429 storm fails fast instead of stalling.
+    Use for loops that issue many requests against rate-limited endpoints.
+    """
+    data: dict = {}
+    for attempt in range(_RETRY_MAX_ATTEMPTS):
+        resp = _client.get(path, params=params)
+        if resp.status_code == 429 and attempt < _RETRY_MAX_ATTEMPTS - 1:
+            retry_after = resp.headers.get("retry-after", "5")
+            try:
+                wait = int(retry_after)
+            except ValueError:
+                wait = 5
+            time.sleep(min(max(wait, 1), _RETRY_MAX_BACKOFF_SECONDS))
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        break
+    return data
+
+
 def _post(path: str, json_body: dict) -> dict:
     """Make a POST request to Zendesk API. Raises on HTTP errors."""
     resp = _client.post(path, json=json_body)
@@ -244,8 +272,12 @@ def search_tickets(query: str, sort_by: str = "", sort_order: str = "") -> str:
             return json.dumps(
                 {"error": f"Invalid sort_by {sort_by!r}; must be one of {_SEARCH_SORT_FIELDS}."}
             )
+        if sort_order and sort_order not in ("asc", "desc"):
+            return json.dumps(
+                {"error": f"Invalid sort_order {sort_order!r}; must be 'asc' or 'desc'."}
+            )
         params["sort_by"] = sort_by
-        params["sort_order"] = "asc" if sort_order == "asc" else "desc"
+        params["sort_order"] = sort_order or "desc"
     data = _get("/search.json", params=params)
     results = data.get("results", [])
     if not results:
@@ -279,18 +311,22 @@ def count_tickets(query: str) -> str:
 
 _EXPORT_PAGE_SIZE = 1000
 _EXPORT_MAX_RESULTS = 10000
+_EXPORT_MAX_PAGES = 50
 
 
 @mcp.tool()
 def export_search_results(query: str, max_results: int = 1000) -> str:
     """Export the full set of tickets matching a search query.
 
-    Unlike `search_tickets` (one page, 1,000-result hard cap), this uses the
-    cursor-based export endpoint: complete, duplicate-free result sets — the
-    right tool for audits and reporting sweeps. Results come back roughly
-    newest-first by created_at; no custom sorting, and strict order is not
-    guaranteed. Zendesk rate-limits this endpoint to 100 requests/minute;
-    each request fetches up to 1,000 tickets.
+    Unlike `search_tickets` (a single page of at most 100 tickets, and the
+    underlying search API stops at 1,000), this uses the cursor-based export
+    endpoint: complete, duplicate-free result sets — the right tool for audits
+    and reporting sweeps. Results come back roughly newest-first by
+    created_at; no custom sorting, and strict order is not guaranteed.
+
+    Retries 429s with Retry-After backoff. Stops after `max_results` tickets
+    (capped at 10,000) or 50 requests, whichever comes first; the response
+    carries a `warning` naming the reason whenever more tickets match.
 
     Args:
         query: Zendesk search query (ticket type is applied automatically).
@@ -304,26 +340,34 @@ def export_search_results(query: str, max_results: int = 1000) -> str:
     """
     limit = max(1, min(max_results, _EXPORT_MAX_RESULTS))
     tickets: list[dict] = []
-    params: dict = {
-        "query": query,
-        "filter[type]": "ticket",
-        "page[size]": min(_EXPORT_PAGE_SIZE, limit),
-    }
+    truncated_by: str | None = None
+    params: dict = {"query": query, "filter[type]": "ticket"}
+    pages = 0
     while True:
-        data = _get("/search/export.json", params=params)
+        params["page[size]"] = min(_EXPORT_PAGE_SIZE, limit - len(tickets))
+        data = _get_with_retry("/search/export.json", params=params)
+        pages += 1
         tickets.extend(_project_ticket(t) for t in data.get("results", []))
         meta = data.get("meta", {})
-        has_more = bool(meta.get("has_more")) and bool(meta.get("after_cursor"))
-        if not has_more or len(tickets) >= limit:
+        if not meta.get("has_more"):
+            break
+        if len(tickets) >= limit:
+            truncated_by = f"max_results ({limit})"
+            break
+        if not meta.get("after_cursor"):
+            truncated_by = "a missing cursor in the Zendesk response"
+            break
+        if pages >= _EXPORT_MAX_PAGES:
+            truncated_by = f"the request cap ({_EXPORT_MAX_PAGES} pages)"
             break
         params["page[after]"] = meta["after_cursor"]
 
-    if not tickets:
+    if not tickets and not truncated_by:
         return "No tickets found."
-    out: dict = {"count": min(len(tickets), limit), "tickets": tickets[:limit]}
-    if has_more or len(tickets) > limit:
+    out: dict = {"returned_count": min(len(tickets), limit), "tickets": tickets[:limit]}
+    if truncated_by:
         out["warning"] = (
-            f"Stopped at max_results={limit}; more tickets match. "
+            f"Result set incomplete — stopped by {truncated_by}; more tickets match. "
             "Raise max_results or narrow the query."
         )
     return json.dumps(out, indent=2)
@@ -513,32 +557,12 @@ def get_ticket_audits(ticket_id: int) -> str:
     return json.dumps(audits, indent=2)
 
 
-_BULK_FETCH_MAX_RETRIES = 3
-_BULK_FETCH_MAX_BACKOFF_SECONDS = 30
-
-
 def _fetch_comments_with_retry(ticket_id: int) -> list[dict]:
-    """Fetch all comments for one ticket, paginated, with 429 backoff.
-
-    Honors Zendesk's Retry-After header up to a cap; capped retries so a
-    sustained-429 storm fails fast instead of stalling all workers.
-    """
+    """Fetch all comments for one ticket, paginated, with 429 backoff."""
     comments: list[dict] = []
     url: str | None = f"/tickets/{ticket_id}/comments.json"
     while url:
-        for attempt in range(_BULK_FETCH_MAX_RETRIES):
-            resp = _client.get(url)
-            if resp.status_code == 429 and attempt < _BULK_FETCH_MAX_RETRIES - 1:
-                retry_after = resp.headers.get("retry-after", "5")
-                try:
-                    wait = int(retry_after)
-                except ValueError:
-                    wait = 5
-                time.sleep(min(max(wait, 1), _BULK_FETCH_MAX_BACKOFF_SECONDS))
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            break
+        data = _get_with_retry(url)
         comments.extend(_project_comment(c) for c in data.get("comments", []))
         url = data.get("next_page")
     return comments
