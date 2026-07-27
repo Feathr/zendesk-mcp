@@ -1,9 +1,9 @@
 """Zendesk MCP Server — ticket triage, management, and admin.
 
 Access levels controlled by ACCESS_LEVEL env var:
-    readonly   — search/read/count tickets, users, views, orgs, audits, bulk read, attachments (11 tools)
-    management — readonly + create/update tickets, comments, tags (16 tools)
-    admin      — management + user/org CRUD, merge, bulk ops, delete (25 tools)
+    readonly   — search/read/count/export tickets, users, views, orgs, audits, bulk read, attachments (12 tools)
+    management — readonly + create/update tickets, comments, tags (17 tools)
+    admin      — management + user/org CRUD, merge, bulk ops, delete (26 tools)
 """
 
 import base64
@@ -54,6 +54,34 @@ def _get(path: str, params: dict | None = None) -> dict:
     resp = _client.get(path, params=params)
     resp.raise_for_status()
     return resp.json()
+
+
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_MAX_BACKOFF_SECONDS = 30
+
+
+def _get_with_retry(path: str, params: dict | None = None) -> dict:
+    """GET with capped 429 backoff. Honors Zendesk's Retry-After header.
+
+    Sleeps at most _RETRY_MAX_BACKOFF_SECONDS per attempt, with capped
+    attempts so a sustained-429 storm fails fast instead of stalling.
+    Use for loops that issue many requests against rate-limited endpoints.
+    """
+    data: dict = {}
+    for attempt in range(_RETRY_MAX_ATTEMPTS):
+        resp = _client.get(path, params=params)
+        if resp.status_code == 429 and attempt < _RETRY_MAX_ATTEMPTS - 1:
+            retry_after = resp.headers.get("retry-after", "5")
+            try:
+                wait = int(retry_after)
+            except ValueError:
+                wait = 5
+            time.sleep(min(max(wait, 1), _RETRY_MAX_BACKOFF_SECONDS))
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        break
+    return data
 
 
 def _post(path: str, json_body: dict) -> dict:
@@ -141,7 +169,7 @@ def _extract_html_content(html: str) -> dict:
     parser = _HtmlContentExtractor()
     try:
         parser.feed(html)
-    except Exception:
+    except Exception:  # noqa: BLE001 — malformed HTML must never break a comment fetch
         return {"links": [], "images": []}
 
     links: list[dict] = []
@@ -195,42 +223,73 @@ def _project_comment(c: dict) -> dict:
     }
 
 
+def _project_ticket(t: dict) -> dict:
+    """Project a raw search-result ticket into the compact list shape."""
+    return {
+        "id": t["id"],
+        "subject": t.get("subject", ""),
+        "status": t.get("status", ""),
+        "priority": t.get("priority", ""),
+        "created_at": t.get("created_at", ""),
+        "updated_at": t.get("updated_at", ""),
+        "assignee_id": t.get("assignee_id"),
+        "requester_id": t.get("requester_id"),
+        "tags": t.get("tags", []),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Read-Only Tools (all access levels)
 # ---------------------------------------------------------------------------
 
+_SEARCH_SORT_FIELDS = ("updated_at", "created_at", "priority", "status", "ticket_type")
+
 
 @mcp.tool()
-def search_tickets(query: str) -> str:
+def search_tickets(query: str, sort_by: str = "", sort_order: str = "") -> str:
     """Search Zendesk tickets using Zendesk search syntax.
+
+    Returns at most one page (100 tickets). When more match, the response
+    includes a `warning` with the total count — use `export_search_results`
+    to page through the full result set.
+
+    Args:
+        query: Zendesk search query (type:ticket is added automatically).
+        sort_by: Optional sort field: updated_at, created_at, priority,
+            status, or ticket_type. Defaults to relevance ranking.
+        sort_order: "asc" or "desc" (only used with sort_by; default "desc").
 
     Examples:
         search_tickets("status:open assignee:me")
-        search_tickets("subject:refund created>2026-01-01")
+        search_tickets("subject:refund created>2026-01-01", sort_by="created_at")
         search_tickets("priority:urgent status:open")
 
     See https://support.zendesk.com/hc/en-us/articles/203663226 for query syntax.
     """
-    data = _get("/search.json", params={"query": f"type:ticket {query}"})
+    params: dict = {"query": f"type:ticket {query}"}
+    if sort_by:
+        if sort_by not in _SEARCH_SORT_FIELDS:
+            return json.dumps(
+                {"error": f"Invalid sort_by {sort_by!r}; must be one of {_SEARCH_SORT_FIELDS}."}
+            )
+        if sort_order and sort_order not in ("asc", "desc"):
+            return json.dumps(
+                {"error": f"Invalid sort_order {sort_order!r}; must be 'asc' or 'desc'."}
+            )
+        params["sort_by"] = sort_by
+        params["sort_order"] = sort_order or "desc"
+    data = _get("/search.json", params=params)
     results = data.get("results", [])
     if not results:
         return "No tickets found."
-    tickets = []
-    for t in results:
-        tickets.append(
-            {
-                "id": t["id"],
-                "subject": t.get("subject", ""),
-                "status": t.get("status", ""),
-                "priority": t.get("priority", ""),
-                "created_at": t.get("created_at", ""),
-                "updated_at": t.get("updated_at", ""),
-                "assignee_id": t.get("assignee_id"),
-                "requester_id": t.get("requester_id"),
-                "tags": t.get("tags", []),
-            }
+    tickets = [_project_ticket(t) for t in results]
+    out: dict = {"total_count": data.get("count", len(tickets)), "tickets": tickets}
+    if data.get("next_page"):
+        out["warning"] = (
+            f"Showing first {len(tickets)} of {out['total_count']} matching tickets. "
+            "Use export_search_results to fetch the full result set."
         )
-    return json.dumps(tickets, indent=2)
+    return json.dumps(out, indent=2)
 
 
 @mcp.tool()
@@ -248,6 +307,70 @@ def count_tickets(query: str) -> str:
     """
     data = _get("/search/count.json", params={"query": f"type:ticket {query}"})
     return json.dumps({"count": data.get("count", 0)})
+
+
+_EXPORT_PAGE_SIZE = 1000
+_EXPORT_MAX_RESULTS = 10000
+_EXPORT_MAX_PAGES = 50
+
+
+@mcp.tool()
+def export_search_results(query: str, max_results: int = 1000) -> str:
+    """Export the full set of tickets matching a search query.
+
+    Unlike `search_tickets` (a single page of at most 100 tickets, and the
+    underlying search API stops at 1,000), this uses the cursor-based export
+    endpoint: complete, duplicate-free result sets — the right tool for audits
+    and reporting sweeps. Results come back roughly newest-first by
+    created_at; no custom sorting, and strict order is not guaranteed.
+
+    Retries 429s with Retry-After backoff. Stops after `max_results` tickets
+    (capped at 10,000) or 50 requests, whichever comes first; the response
+    carries a `warning` naming the reason whenever more tickets match.
+
+    Args:
+        query: Zendesk search query (ticket type is applied automatically).
+        max_results: Stop after this many tickets (default 1000, max 10000).
+
+    Examples:
+        export_search_results("tags:escalation created>2026-01-01")
+        export_search_results("status:solved solved>2026-06-01", max_results=5000)
+
+    See https://support.zendesk.com/hc/en-us/articles/203663226 for query syntax.
+    """
+    limit = max(1, min(max_results, _EXPORT_MAX_RESULTS))
+    tickets: list[dict] = []
+    truncated_by: str | None = None
+    params: dict = {"query": query, "filter[type]": "ticket"}
+    pages = 0
+    while True:
+        params["page[size]"] = min(_EXPORT_PAGE_SIZE, limit - len(tickets))
+        data = _get_with_retry("/search/export.json", params=params)
+        pages += 1
+        tickets.extend(_project_ticket(t) for t in data.get("results", []))
+        meta = data.get("meta", {})
+        if not meta.get("has_more"):
+            break
+        if len(tickets) >= limit:
+            truncated_by = f"max_results ({limit})"
+            break
+        if not meta.get("after_cursor"):
+            truncated_by = "a missing cursor in the Zendesk response"
+            break
+        if pages >= _EXPORT_MAX_PAGES:
+            truncated_by = f"the request cap ({_EXPORT_MAX_PAGES} pages)"
+            break
+        params["page[after]"] = meta["after_cursor"]
+
+    if not tickets and not truncated_by:
+        return "No tickets found."
+    out: dict = {"returned_count": min(len(tickets), limit), "tickets": tickets[:limit]}
+    if truncated_by:
+        out["warning"] = (
+            f"Result set incomplete — stopped by {truncated_by}; more tickets match. "
+            "Raise max_results or narrow the query."
+        )
+    return json.dumps(out, indent=2)
 
 
 @mcp.tool()
@@ -434,32 +557,12 @@ def get_ticket_audits(ticket_id: int) -> str:
     return json.dumps(audits, indent=2)
 
 
-_BULK_FETCH_MAX_RETRIES = 3
-_BULK_FETCH_MAX_BACKOFF_SECONDS = 30
-
-
 def _fetch_comments_with_retry(ticket_id: int) -> list[dict]:
-    """Fetch all comments for one ticket, paginated, with 429 backoff.
-
-    Honors Zendesk's Retry-After header up to a cap; capped retries so a
-    sustained-429 storm fails fast instead of stalling all workers.
-    """
+    """Fetch all comments for one ticket, paginated, with 429 backoff."""
     comments: list[dict] = []
     url: str | None = f"/tickets/{ticket_id}/comments.json"
     while url:
-        for attempt in range(_BULK_FETCH_MAX_RETRIES):
-            resp = _client.get(url)
-            if resp.status_code == 429 and attempt < _BULK_FETCH_MAX_RETRIES - 1:
-                retry_after = resp.headers.get("retry-after", "5")
-                try:
-                    wait = int(retry_after)
-                except ValueError:
-                    wait = 5
-                time.sleep(min(max(wait, 1), _BULK_FETCH_MAX_BACKOFF_SECONDS))
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            break
+        data = _get_with_retry(url)
         comments.extend(_project_comment(c) for c in data.get("comments", []))
         url = data.get("next_page")
     return comments
@@ -492,7 +595,7 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
             tid = futures[fut]
             try:
                 results[str(tid)] = fut.result()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — one failed ticket must not kill the batch
                 errors[str(tid)] = str(exc)
 
     out: dict = {"comments_by_ticket": results}

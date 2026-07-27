@@ -6,15 +6,16 @@ A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk
 
 | Level | Tools | Who should use it |
 |-------|-------|-------------------|
-| **readonly** | Search/read/count tickets, users, views, orgs, audits, bulk reads, attachments (11 tools) | Everyone |
-| **management** | readonly + create/update tickets, comments, tags (16 tools) | Team leads, support agents |
-| **admin** | management + user/org CRUD, merge, bulk ops, delete (25 tools) | Zendesk admins only |
+| **readonly** | Search/read/count/export tickets, users, views, orgs, audits, bulk reads, attachments (12 tools) | Everyone |
+| **management** | readonly + create/update tickets, comments, tags (17 tools) | Team leads, support agents |
+| **admin** | management + user/org CRUD, merge, bulk ops, delete (26 tools) | Zendesk admins only |
 
 ## Available Tools
 
 ### Read-Only (all levels)
-- `search_tickets` — Search tickets using Zendesk query syntax
+- `search_tickets` — Search tickets using Zendesk query syntax (one page; supports sorting, warns on truncation)
 - `count_tickets` — Count tickets matching a search query (fast, not subject to search result limits)
+- `export_search_results` — Export full result sets via cursor pagination (no 1,000-result cap; for audits/reports)
 - `get_ticket` — Get full ticket details by ID
 - `get_ticket_comments` — Get all comments/replies on a ticket (with extracted links, images, and attachment metadata)
 - `get_ticket_audits` — Audit log for a ticket (Change/Notification events, paginated)
