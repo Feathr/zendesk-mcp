@@ -1,9 +1,10 @@
 """Zendesk MCP Server — ticket triage, management, and admin.
 
 Access levels controlled by ACCESS_LEVEL env var:
-    readonly   — search/read/count/export tickets, users, views, orgs, audits, bulk read, attachments (12 tools)
-    management — readonly + create/update tickets, comments, tags (17 tools)
-    admin      — management + user/org CRUD, merge, bulk ops, delete (26 tools)
+    readonly   — search/read/count/export tickets, users, views, orgs, audits, bulk read,
+        attachments, articles (14 tools)
+    management — readonly + create/update tickets, comments, tags (19 tools)
+    admin      — management + user/org CRUD, merge, bulk ops, delete (28 tools)
 """
 
 import base64
@@ -238,15 +239,48 @@ def _project_ticket(t: dict) -> dict:
     }
 
 
+def _project_article(a: dict) -> dict:
+    """Project a raw search-result article into the compact list shape.
+    snippet = A relevant content snippet in the result, with <em> tags applied to the search term and any
+    HTML from the source removed
+    """
+    return {
+        "id": a["id"],
+        "title": a.get("title", ""),
+        "html_url": a.get("html_url", ""),
+        "edited_at": a.get("edited_at", ""),
+        "snippet": a.get("snippet", ""),
+        "label_names": a.get("label_names", []),
+    }
+
+
+_SEARCH_SORT_FIELDS = {
+    "ticket": ["updated_at", "created_at", "priority", "status", "ticket_type"],
+    "article": ["updated_at", "created_at"],
+}
+
+
+def _validate_search(
+    sort_by: str, sort_order: str, search_type: str, query: str = "", label_names: str = ""
+) -> dict:
+    search_sort_fields = _SEARCH_SORT_FIELDS[search_type]
+    if not (query or label_names) and search_type == "article":
+        return {"error": "Must pass either query or label_names, or both."}
+    if sort_by:
+        if sort_by not in search_sort_fields:
+            return {"error": f"Invalid sort_by {sort_by!r}; must be one of {search_sort_fields}."}
+        if sort_order not in ("asc", "desc"):
+            return {"error": f"Invalid sort_order {sort_order!r}; must be 'asc' or 'desc'."}
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Read-Only Tools (all access levels)
 # ---------------------------------------------------------------------------
 
-_SEARCH_SORT_FIELDS = ("updated_at", "created_at", "priority", "status", "ticket_type")
-
 
 @mcp.tool()
-def search_tickets(query: str, sort_by: str = "", sort_order: str = "") -> str:
+def search_tickets(query: str, sort_by: str = "", sort_order: str = "desc") -> str:
     """Search Zendesk tickets using Zendesk search syntax.
 
     Returns at most one page (100 tickets). When more match, the response
@@ -266,18 +300,12 @@ def search_tickets(query: str, sort_by: str = "", sort_order: str = "") -> str:
 
     See https://support.zendesk.com/hc/en-us/articles/203663226 for query syntax.
     """
+    errors = _validate_search(sort_by=sort_by, sort_order=sort_order, search_type="ticket")
+    if errors:
+        return json.dumps(errors)
     params: dict = {"query": f"type:ticket {query}"}
     if sort_by:
-        if sort_by not in _SEARCH_SORT_FIELDS:
-            return json.dumps(
-                {"error": f"Invalid sort_by {sort_by!r}; must be one of {_SEARCH_SORT_FIELDS}."}
-            )
-        if sort_order and sort_order not in ("asc", "desc"):
-            return json.dumps(
-                {"error": f"Invalid sort_order {sort_order!r}; must be 'asc' or 'desc'."}
-            )
-        params["sort_by"] = sort_by
-        params["sort_order"] = sort_order or "desc"
+        params |= {"sort_by": sort_by, "sort_order": sort_order}
     data = _get("/search.json", params=params)
     results = data.get("results", [])
     if not results:
@@ -723,6 +751,110 @@ def fetch_attachment(url: str, max_size_mb: int = 10):
             "preview_b64_first_64": base64.b64encode(content[:64]).decode("ascii"),
         }
     )
+
+
+_ARTICLES_MAX_RESULTS = 1000
+_ARTICLES_PER_PAGE = 100
+
+
+@mcp.tool()
+def search_articles(
+    query: str = "",
+    label_names: str | None = None,
+    sort_by: str = "",
+    sort_order: str = "desc",
+    max_results: int = 50,
+) -> str:
+    """Search the Help Center for articles, including ones restricted to a user segment.
+
+    Returns a default number of 50 articles, up to a maximum of 1000 results, with 100 articles per page.
+    Plain text only — ticket operators like status:open match as literal words. Drafts are not indexed.
+
+    Args:
+        query: The search text to be matched. Example: "goal segment". Supply query, label_names, or both.
+        label_names: A string consisting of label names separated by commas.  Articles matching any of the
+            labels are returned. Case-insensitive; labels may contain spaces. None by default.
+        sort_by: Optional sort field: "created_at" or "updated_at". Defaults to relevance ranking.
+        sort_order: "asc" or "desc" (only used with sort_by; default "desc").
+        max_results: Maximum number of articles to be returned. Default is 50; maximum is 1000.
+
+    Examples:
+        search_articles("goal segment")
+        search_articles("email", label_names="Best Practices,groups")
+        search_articles("", label_names="Retargeting")
+        search_articles("upsync", sort_by="updated_at", max_results=10)
+
+    Return: a json object that contains a list of articles, the max_result reconciled against the
+        1000-result maximum, and the total number of articles that matched the query. Includes a warning
+        if the number of articles returned is lower than total matches.
+        Does not return article body. Use get_article() for individual article body and user segment ids.
+
+    See https://developer.zendesk.com/api-reference/help_center/help-center-api/articles/ for the endpoint spec.
+    """
+    errors = _validate_search(
+        query=query,
+        label_names=label_names,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        search_type="article",
+    )
+    if errors:
+        return json.dumps(errors)
+    params: dict = {"query": query, "page": 1, "per_page": _ARTICLES_PER_PAGE}
+    if label_names:
+        params["label_names"] = label_names
+    if sort_by:
+        params |= {"sort_by": sort_by, "sort_order": sort_order}
+    articles: list[dict] = []
+    count = 0
+    limit = max(1, min(max_results, _ARTICLES_MAX_RESULTS))
+    warning: str = ""
+    while True:
+        data = _get("/help_center/articles/search.json", params=params)
+        count = data.get("count", 0) if not count else count
+        articles.extend([_project_article(a) for a in data.get("results", [])])
+        if len(articles) == count:
+            warning = f"Showing {count} matching articles. Ranked by relevance by default."
+            break
+        if len(articles) >= limit:
+            warning = (
+                f"Showing first {limit} of {count} matching articles. "
+                f"Ranked by relevance by default. Endpoint can only gather {_ARTICLES_MAX_RESULTS} articles total."
+            )
+            break
+        if not data.get("next_page"):
+            break
+        params["page"] += 1
+
+    if not articles:
+        return "No articles found."
+    out: dict = {
+        "articles": articles[:limit],
+        "max_results": limit,
+        "total_count": count or len(articles),
+    }
+    if warning:
+        out["warning"] = warning
+    return json.dumps(out, indent=2)
+
+
+@mcp.tool()
+def get_article(article_id: int) -> str:
+    """Get full details for a single Help Desk article by ID."""
+    data = _get(f"/help_center/articles/{article_id}.json")
+    a = data["article"]
+    result = {
+        "id": a["id"],
+        "html_url": a.get("html_url", ""),
+        "title": a.get("title", ""),
+        "body": a.get("body", ""),
+        "edited_at": a.get("edited_at", ""),
+        "updated_at": a.get("updated_at", ""),
+        "user_segment_id": a.get("user_segment_id", None),
+        "user_segment_ids": a.get("user_segment_ids", a.get("user_segment_id", None)),
+        "draft": a.get("draft", False),
+    }
+    return json.dumps(result, indent=2)
 
 
 # ---------------------------------------------------------------------------
