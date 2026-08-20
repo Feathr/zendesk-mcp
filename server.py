@@ -241,7 +241,7 @@ def _project_ticket(t: dict) -> dict:
 
 def _project_article(a: dict) -> dict:
     """Project a raw search-result article into the compact list shape.
-    snippet = A relevant content snippet in the result, with <em> tags applied to the search term and any
+    Snippet contains a relevant content snippet in the result, with <em> tags applied to the search term and any
     HTML from the source removed
     """
     return {
@@ -261,7 +261,7 @@ _SEARCH_SORT_FIELDS = {
 
 
 def _validate_search(
-    sort_by: str, sort_order: str, search_type: str, query: str = "", label_names: str = ""
+    sort_by: str, sort_order: str, search_type: str, query: str = "", label_names: list[str] | None = None
 ) -> dict:
     search_sort_fields = _SEARCH_SORT_FIELDS[search_type]
     if not (query or label_names) and search_type == "article":
@@ -760,20 +760,20 @@ _ARTICLES_PER_PAGE = 100
 @mcp.tool()
 def search_articles(
     query: str = "",
-    label_names: str | None = None,
+    label_names: list[str] | None = None,
     sort_by: str = "",
     sort_order: str = "desc",
     max_results: int = 50,
 ) -> str:
     """Search the Help Center for articles, including ones restricted to a user segment.
 
-    Returns a default number of 50 articles, up to a maximum of 1000 results, with 100 articles per page.
+    Returns a default number of 50 article summaries, up to a maximum of 1000 results.
     Plain text only — ticket operators like status:open match as literal words. Drafts are not indexed.
 
     Args:
         query: The search text to be matched. Example: "goal segment". Supply query, label_names, or both.
-        label_names: A string consisting of label names separated by commas.  Articles matching any of the
-            labels are returned. Case-insensitive; labels may contain spaces. None by default.
+        label_names: A list of strings consisting of label names. Articles matching any of the labels are
+            returned. Case-insensitive; labels may contain spaces. None by default.
         sort_by: Optional sort field: "created_at" or "updated_at". Defaults to relevance ranking.
         sort_order: "asc" or "desc" (only used with sort_by; default "desc").
         max_results: Maximum number of articles to be returned. Default is 50; maximum is 1000.
@@ -784,9 +784,10 @@ def search_articles(
         search_articles("", label_names="Retargeting")
         search_articles("upsync", sort_by="updated_at", max_results=10)
 
-    Return: a json object that contains a list of articles, the max_result reconciled against the
+    Returns: 
+        A json object that contains a list of article summaries, the max_result reconciled against the
         1000-result maximum, and the total number of articles that matched the query. Includes a warning
-        if the number of articles returned is lower than total matches.
+        if the number of article summaries returned is lower than total matches.
         Does not return article body. Use get_article() for individual article body and user segment ids.
 
     See https://developer.zendesk.com/api-reference/help_center/help-center-api/articles/ for the endpoint spec.
@@ -802,7 +803,7 @@ def search_articles(
         return json.dumps(errors)
     params: dict = {"query": query, "page": 1, "per_page": _ARTICLES_PER_PAGE}
     if label_names:
-        params["label_names"] = label_names
+        params["label_names"] = ", ".join(label_names)
     if sort_by:
         params |= {"sort_by": sort_by, "sort_order": sort_order}
     articles: list[dict] = []
@@ -813,16 +814,14 @@ def search_articles(
         data = _get("/help_center/articles/search.json", params=params)
         count = data.get("count", 0) if not count else count
         articles.extend([_project_article(a) for a in data.get("results", [])])
-        if len(articles) == count:
-            warning = f"Showing {count} matching articles. Ranked by relevance by default."
-            break
-        if len(articles) >= limit:
+        next_page = data.get("next_page")
+        if (len(articles) > limit) or (len(articles) == limit and next_page):
             warning = (
-                f"Showing first {limit} of {count} matching articles. "
+                f"Showing first {limit} of {count or 'unknown'} matching articles. "
                 f"Ranked by relevance by default. Endpoint can only gather {_ARTICLES_MAX_RESULTS} articles total."
             )
             break
-        if not data.get("next_page"):
+        if not next_page:
             break
         params["page"] += 1
 
