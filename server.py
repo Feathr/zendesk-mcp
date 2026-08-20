@@ -9,6 +9,7 @@ Access levels controlled by ACCESS_LEVEL env var:
 
 import base64
 import json
+import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -242,7 +243,7 @@ def _project_ticket(t: dict) -> dict:
 def _project_article(a: dict) -> dict:
     """Project a raw search-result article into the compact list shape.
     Snippet contains a relevant content snippet in the result, with <em> tags applied to the search term and any
-    HTML from the source removed
+    HTML from the source removed.
     """
     return {
         "id": a["id"],
@@ -261,7 +262,11 @@ _SEARCH_SORT_FIELDS = {
 
 
 def _validate_search(
-    sort_by: str, sort_order: str, search_type: str, query: str = "", label_names: list[str] | None = None
+    sort_by: str,
+    sort_order: str,
+    search_type: str,
+    query: str = "",
+    label_names: list[str] | None = None,
 ) -> dict:
     search_sort_fields = _SEARCH_SORT_FIELDS[search_type]
     if not (query or label_names) and search_type == "article":
@@ -753,8 +758,9 @@ def fetch_attachment(url: str, max_size_mb: int = 10):
     )
 
 
-_ARTICLES_MAX_RESULTS = 1000
+_ARTICLES_MAX_RESULTS = 1000  # hard API limit; don't raise past 1000
 _ARTICLES_PER_PAGE = 100
+_ARTICLES_MAX_PAGES = math.ceil(_ARTICLES_MAX_RESULTS / _ARTICLES_PER_PAGE)
 
 
 @mcp.tool()
@@ -770,6 +776,9 @@ def search_articles(
     Returns a default number of 50 article summaries, up to a maximum of 1000 results.
     Plain text only — ticket operators like status:open match as literal words. Drafts are not indexed.
 
+    Retries 429s with Retry-After backoff. Stops after max_results articles, the endpoint's
+    1000-article ceiling, or 10 requests, whichever comes first.
+
     Args:
         query: The search text to be matched. Example: "goal segment". Supply query, label_names, or both.
         label_names: A list of strings consisting of label names. Articles matching any of the labels are
@@ -780,18 +789,21 @@ def search_articles(
 
     Examples:
         search_articles("goal segment")
-        search_articles("email", label_names="Best Practices,groups")
-        search_articles("", label_names="Retargeting")
+        search_articles("email", label_names=["Best Practices", "groups"])
+        search_articles("", label_names=["Retargeting"])
         search_articles("upsync", sort_by="updated_at", max_results=10)
 
-    Returns: 
-        A json object that contains a list of article summaries, the max_result reconciled against the
-        1000-result maximum, and the total number of articles that matched the query. Includes a warning
-        if the number of article summaries returned is lower than total matches.
-        Does not return article body. Use get_article() for individual article body and user segment ids.
+    Returns:
+        A json object that contains a list of article summaries, max_results reconciled against the
+        1000-result maximum, and the total number of articles that matched the query. (Note: the
+        endpoint caps total_count at 1000.) Includes a warning when max_results or the endpoint's
+        1000-article ceiling cut the result set short. Does not return article body. Use
+        get_article() for individual article body and user segment id(s).
 
     See https://developer.zendesk.com/api-reference/help_center/help-center-api/articles/ for the endpoint spec.
     """
+    query = query.strip()
+    label_names = [label.strip() for label in label_names or [] if label.strip()]
     errors = _validate_search(
         query=query,
         label_names=label_names,
@@ -803,22 +815,31 @@ def search_articles(
         return json.dumps(errors)
     params: dict = {"query": query, "page": 1, "per_page": _ARTICLES_PER_PAGE}
     if label_names:
-        params["label_names"] = ", ".join(label_names)
+        params["label_names"] = ",".join(label_names)
     if sort_by:
         params |= {"sort_by": sort_by, "sort_order": sort_order}
     articles: list[dict] = []
     count = 0
+    page_count = 0
     limit = max(1, min(max_results, _ARTICLES_MAX_RESULTS))
     warning: str = ""
-    while True:
-        data = _get("/help_center/articles/search.json", params=params)
-        count = data.get("count", 0) if not count else count
+    while page_count < _ARTICLES_MAX_PAGES:
+        data = _get_with_retry("/help_center/articles/search.json", params=params)
+        count = count or data.get("count", 0)
         articles.extend([_project_article(a) for a in data.get("results", [])])
         next_page = data.get("next_page")
+        page_count += 1
+        if len(articles) == _ARTICLES_MAX_RESULTS == limit:
+            warning = (
+                f"Showing first {_ARTICLES_MAX_RESULTS} matching articles. Ranked by relevance by "
+                "default. There may be additional matches, but the endpoint can only gather "
+                f"{_ARTICLES_MAX_RESULTS} articles total."
+            )
+            break
         if (len(articles) > limit) or (len(articles) == limit and next_page):
             warning = (
                 f"Showing first {limit} of {count or 'unknown'} matching articles. "
-                f"Ranked by relevance by default. Endpoint can only gather {_ARTICLES_MAX_RESULTS} articles total."
+                f"Ranked by relevance by default. Raise max_results (up to {_ARTICLES_MAX_RESULTS}) to get more."
             )
             break
         if not next_page:
@@ -839,7 +860,7 @@ def search_articles(
 
 @mcp.tool()
 def get_article(article_id: int) -> str:
-    """Get full details for a single Help Desk article by ID."""
+    """Get full details for a single Help Center article by ID."""
     data = _get(f"/help_center/articles/{article_id}.json")
     a = data["article"]
     result = {
@@ -849,8 +870,8 @@ def get_article(article_id: int) -> str:
         "body": a.get("body", ""),
         "edited_at": a.get("edited_at", ""),
         "updated_at": a.get("updated_at", ""),
-        "user_segment_id": a.get("user_segment_id", None),
-        "user_segment_ids": a.get("user_segment_ids", a.get("user_segment_id", None)),
+        "user_segment_id": a.get("user_segment_id"),
+        "user_segment_ids": a.get("user_segment_ids"),
         "draft": a.get("draft", False),
     }
     return json.dumps(result, indent=2)
