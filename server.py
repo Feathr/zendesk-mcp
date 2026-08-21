@@ -269,6 +269,11 @@ def _validate_search(
     label_names: list[str] | None = None,
 ) -> dict:
     search_sort_fields = _SEARCH_SORT_FIELDS[search_type]
+    if not query and search_type == "ticket":
+        return {
+            "error": "Must pass query. "
+            "Use export_search_results or get_view_tickets for broad sweeps."
+        }
     if not (query or label_names) and search_type == "article":
         return {"error": "Must pass either query or label_names, or both."}
     if sort_by:
@@ -305,7 +310,10 @@ def search_tickets(query: str, sort_by: str = "", sort_order: str = "desc") -> s
 
     See https://support.zendesk.com/hc/en-us/articles/203663226 for query syntax.
     """
-    errors = _validate_search(sort_by=sort_by, sort_order=sort_order, search_type="ticket")
+    query = query.strip()
+    errors = _validate_search(
+        query=query, sort_by=sort_by, sort_order=sort_order, search_type="ticket"
+    )
     if errors:
         return json.dumps(errors)
     params: dict = {"query": f"type:ticket {query}"}
