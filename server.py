@@ -809,8 +809,8 @@ def search_articles(
         endpoint caps total_count at 1000.) Includes a warning when max_results or the endpoint's
         1000-article ceiling cut the result set short. user_segment_id and user_segment_ids
         indicate if an article is restricted to a user segment; public if both are null. User
-        segment field use depends on Guide plan. Does not return article body. Use get_article()
-        for individual article body.
+        segment field use depends on Guide plan. Use list_user_segments() to resolve segment IDs to names.
+        Does not return article body. Use get_article() for individual article body.
 
     See https://developer.zendesk.com/api-reference/help_center/help-center-api/articles/ for the endpoint spec.
     """
@@ -875,7 +875,8 @@ def get_article(article_id: int) -> str:
     """Get full details for a single Help Center article by ID.
 
     user_segment_id and user_segment_ids indicate if an article is restricted to a user segment;
-    public if both are null. User segment field use depends on Guide plan.
+    public if both are null. User segment field use depends on Guide plan. Use list_user_segments() to resolve
+    segment IDs to names.
     """
     data = _get(f"/help_center/articles/{article_id}.json")
     a = data["article"]
