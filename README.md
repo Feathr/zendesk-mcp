@@ -6,9 +6,9 @@ A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk
 
 | Level | Tools | Who should use it |
 |-------|-------|-------------------|
-| **readonly** | Search/read/count/export tickets, users, views, orgs, audits, bulk reads, attachments, articles (14 tools) | Everyone |
-| **management** | readonly + create/update tickets, comments, tags (19 tools) | Team leads, support agents |
-| **admin** | management + user/org CRUD, merge, bulk ops, delete (28 tools) | Zendesk admins only |
+| **readonly** | Search/read/count/export tickets, users, views, orgs, audits, bulk reads, attachments, articles (15 tools) | Everyone |
+| **management** | readonly + create/update tickets, comments, tags (20 tools) | Team leads, support agents |
+| **admin** | management + user/org CRUD, merge, bulk ops, delete (29 tools) | Zendesk admins only |
 
 ## Available Tools
 
@@ -27,6 +27,7 @@ A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk
 - `list_views` — List all available views with IDs
 - `search_articles` — Search Help Center articles, public and private (supports sorting and label filtering; default 50 results, 1,000 max)
 - `get_article` — Get a single Help Center article by ID, including its body
+- `list_user_segments` — List the user segments applicable to the current Guide plan, with IDs and names
 
 ### Ticket Management (management + admin)
 - `create_ticket` — Create a new ticket
