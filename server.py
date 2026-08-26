@@ -894,17 +894,23 @@ def get_article(article_id: int) -> str:
     return json.dumps(result, indent=2)
 
 
+_USER_SEGMENTS_PER_PAGE = 100
+
+
 @mcp.tool()
 def list_user_segments() -> str:
     """List all Zendesk user segments available on the current Guide plan.
 
     Returns:
-        1 page, 100 results max with user segment IDs, names, user type, and tags.
-        tags takes AND logic, or_tags takes OR logic
+        A JSON object of user segments; 1 page, 100 results max. Each user segment has fields for ID, name, user type,
+        tags, and or_tags. To view an article, a user must have all tags listed in the tags field, and, when
+        or_tags is set, at least one tag from it. Includes a warning when the 100-result max cuts the result
+        set short.
 
     See https://developer.zendesk.com/api-reference/help_center/help-center-api/user_segments/ for the endpoint spec.
     """
-    data = _get("/help_center/user_segments/applicable.json")
+    data = _get("/help_center/user_segments/applicable.json", {"per_page": _USER_SEGMENTS_PER_PAGE})
+    count = data.get("count", 0)
     user_segments = []
     for user_segment in data.get("user_segments", []):
         user_segments.append(
@@ -916,7 +922,12 @@ def list_user_segments() -> str:
                 "or_tags": user_segment.get("or_tags", []),
             }
         )
-    return json.dumps(user_segments, indent=2)
+    out: dict = {"user_segments": user_segments}
+    if data.get("next_page"):
+        out["warning"] = (
+            f"Showing first {_USER_SEGMENTS_PER_PAGE} of {count or 'unknown'} user segments."
+        )
+    return json.dumps(out, indent=2)
 
 
 # ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@ A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk
 - `list_views` — List all available views with IDs
 - `search_articles` — Search Help Center articles, public and private (supports sorting and label filtering; default 50 results, 1,000 max)
 - `get_article` — Get a single Help Center article by ID, including its body
-- `list_user_segments` — List the user segments applicable to the current Guide plan, with IDs and names
+- `list_user_segments` — List the user segments applicable to the current Guide plan (ID, name, user type, and tag rules)
 
 ### Ticket Management (management + admin)
 - `create_ticket` — Create a new ticket
