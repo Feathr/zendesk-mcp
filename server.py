@@ -2,9 +2,9 @@
 
 Access levels controlled by ACCESS_LEVEL env var:
     readonly   — search/read/count/export tickets, users, views, orgs, audits, bulk read,
-        attachments, articles (14 tools)
-    management — readonly + create/update tickets, comments, tags (19 tools)
-    admin      — management + user/org CRUD, merge, bulk ops, delete (28 tools)
+        attachments, articles (15 tools)
+    management — readonly + create/update tickets, comments, tags (20 tools)
+    admin      — management + user/org CRUD, merge, bulk ops, delete (29 tools)
 """
 
 import base64
@@ -252,6 +252,8 @@ def _project_article(a: dict) -> dict:
         "edited_at": a.get("edited_at", ""),
         "snippet": a.get("snippet", ""),
         "label_names": a.get("label_names", []),
+        "user_segment_id": a.get("user_segment_id"),
+        "user_segment_ids": a.get("user_segment_ids"),
     }
 
 
@@ -805,8 +807,10 @@ def search_articles(
         A json object that contains a list of article summaries, max_results reconciled against the
         1000-result maximum, and the total number of articles that matched the query. (Note: the
         endpoint caps total_count at 1000.) Includes a warning when max_results or the endpoint's
-        1000-article ceiling cut the result set short. Does not return article body. Use
-        get_article() for individual article body and user segment id(s).
+        1000-article ceiling cut the result set short. user_segment_id and user_segment_ids
+        indicate if an article is restricted to a user segment; public if both are null. User
+        segment field use depends on Guide plan. Use list_user_segments() to resolve segment IDs to names.
+        Does not return article body. Use get_article() for individual article body.
 
     See https://developer.zendesk.com/api-reference/help_center/help-center-api/articles/ for the endpoint spec.
     """
@@ -868,7 +872,12 @@ def search_articles(
 
 @mcp.tool()
 def get_article(article_id: int) -> str:
-    """Get full details for a single Help Center article by ID."""
+    """Get full details for a single Help Center article by ID.
+
+    user_segment_id and user_segment_ids indicate if an article is restricted to a user segment;
+    public if both are null. User segment field use depends on Guide plan. Use list_user_segments() to resolve
+    segment IDs to names.
+    """
     data = _get(f"/help_center/articles/{article_id}.json")
     a = data["article"]
     result = {
@@ -883,6 +892,42 @@ def get_article(article_id: int) -> str:
         "draft": a.get("draft", False),
     }
     return json.dumps(result, indent=2)
+
+
+_USER_SEGMENTS_PER_PAGE = 100
+
+
+@mcp.tool()
+def list_user_segments() -> str:
+    """List all Zendesk user segments available on the current Guide plan.
+
+    Returns:
+        A JSON object of user segments; 1 page, 100 results max. Each user segment has fields for ID, name, user type,
+        tags, and or_tags. To view an article, a user must have all tags listed in the tags field, and, when
+        or_tags is set, at least one tag from it. Includes a warning when the 100-result max cuts the result
+        set short.
+
+    See https://developer.zendesk.com/api-reference/help_center/help-center-api/user_segments/ for the endpoint spec.
+    """
+    data = _get("/help_center/user_segments/applicable.json", {"per_page": _USER_SEGMENTS_PER_PAGE})
+    count = data.get("count", 0)
+    user_segments = []
+    for user_segment in data.get("user_segments", []):
+        user_segments.append(
+            {
+                "id": user_segment["id"],
+                "name": user_segment.get("name", ""),
+                "user_type": user_segment.get("user_type", ""),
+                "tags": user_segment.get("tags", []),
+                "or_tags": user_segment.get("or_tags", []),
+            }
+        )
+    out: dict = {"user_segments": user_segments}
+    if data.get("next_page"):
+        out["warning"] = (
+            f"Showing first {_USER_SEGMENTS_PER_PAGE} of {count or 'unknown'} user segments."
+        )
+    return json.dumps(out, indent=2)
 
 
 # ---------------------------------------------------------------------------
