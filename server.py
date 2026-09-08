@@ -2,9 +2,9 @@
 
 Access levels controlled by ACCESS_LEVEL env var:
     readonly   — search/read/count/export tickets, users, views, orgs, audits, bulk read,
-        attachments, articles (15 tools)
-    management — readonly + create/update tickets, comments, tags (20 tools)
-    admin      — management + user/org CRUD, merge, bulk ops, delete (29 tools)
+        attachments, articles (17 tools)
+    management — readonly + create/update tickets, comments, tags (22 tools)
+    admin      — management + user/org CRUD, merge, bulk ops, delete (31 tools)
 """
 
 import base64
@@ -810,7 +810,7 @@ def search_articles(
         1000-article ceiling cut the result set short. user_segment_id and user_segment_ids
         indicate if an article is restricted to a user segment; public if both are null. User
         segment field use depends on Guide plan. Use list_user_segments() to resolve segment IDs to names.
-        Does not return article body. Use get_article() for individual article body.
+        Use get_article() for article body, section_id, and content_tag_ids.
 
     See https://developer.zendesk.com/api-reference/help_center/help-center-api/articles/ for the endpoint spec.
     """
@@ -876,7 +876,8 @@ def get_article(article_id: int) -> str:
 
     user_segment_id and user_segment_ids indicate if an article is restricted to a user segment;
     public if both are null. User segment field use depends on Guide plan. Use list_user_segments() to resolve
-    segment IDs to names.
+    segment IDs to names. Use list_categories_and_sections() to find the article's category and section,
+    and list_content_tags() to resolve content_tag_ids to names.
     """
     data = _get(f"/help_center/articles/{article_id}.json")
     a = data["article"]
@@ -890,6 +891,9 @@ def get_article(article_id: int) -> str:
         "user_segment_id": a.get("user_segment_id"),
         "user_segment_ids": a.get("user_segment_ids"),
         "draft": a.get("draft", False),
+        "section_id": a.get("section_id"),
+        "label_names": a.get("label_names", []),
+        "content_tag_ids": a.get("content_tag_ids", []),
     }
     return json.dumps(result, indent=2)
 
@@ -926,6 +930,133 @@ def list_user_segments() -> str:
     if data.get("next_page"):
         out["warning"] = (
             f"Showing first {_USER_SEGMENTS_PER_PAGE} of {count or 'unknown'} user segments."
+        )
+    return json.dumps(out, indent=2)
+
+
+_CATEGORIES_PER_PAGE = 100
+_SECTIONS_PER_PAGE = 100
+
+
+@mcp.tool()
+def list_categories_and_sections() -> str:
+    """List all Help Center sections, grouped by the category they belong to.
+
+    Returns:
+        A JSON object of returned category and section counts, and categories keyed by category ID; 1 page,
+        100 categories and 100 sections max. Each category has fields for name, html_url, and sections, and
+        each section has fields for ID, name, and html_url. Includes a warning when either 100-result max
+        cuts the result set short, and when a section is omitted because a category is missing from the response.
+
+    See https://developer.zendesk.com/api-reference/help_center/help-center-api/categories/ and
+    https://developer.zendesk.com/api-reference/help_center/help-center-api/sections/ for the endpoint specs.
+    """
+    categories_data = _get("/help_center/categories.json", {"per_page": _CATEGORIES_PER_PAGE})
+    categories_and_sections: dict = {}
+    for category in categories_data.get("categories", []):
+        categories_and_sections[category["id"]] = {
+            "name": category.get("name", ""),
+            "html_url": category.get("html_url", ""),
+            "sections": [],
+        }
+
+    if not categories_and_sections:
+        return "No categories found."
+
+    sections_data = _get("/help_center/sections.json", {"per_page": _SECTIONS_PER_PAGE})
+    returned_section_count = 0
+    omitted_section_count = 0
+    for section in sections_data.get("sections", []):
+        parent_category = categories_and_sections.get(section.get("category_id"))
+        if parent_category is None:
+            omitted_section_count += 1
+            continue
+        parent_category["sections"].append(
+            {
+                "id": section["id"],
+                "name": section.get("name", ""),
+                "html_url": section.get("html_url", ""),
+            }
+        )
+        returned_section_count += 1
+
+    out: dict = {
+        "returned_category_count": len(categories_and_sections),
+        "returned_section_count": returned_section_count,
+        "categories_and_sections": categories_and_sections,
+    }
+    warnings = []
+    if categories_data.get("next_page"):
+        category_count = categories_data.get("count") or "unknown"
+        warnings.append(f"Showing first {_CATEGORIES_PER_PAGE} of {category_count} categories.")
+    if sections_data.get("next_page"):
+        section_count = sections_data.get("count") or "unknown"
+        warnings.append(f"Showing first {_SECTIONS_PER_PAGE} of {section_count} sections.")
+    if omitted_section_count:
+        warnings.append(
+            f"Omitted {omitted_section_count} sections whose category is not in this response."
+        )
+    if warnings:
+        out["warning"] = " ".join(warnings)
+    return json.dumps(out, indent=2)
+
+
+_CONTENT_TAGS_PAGE_SIZE = 30  # hard API limit; requests above 30 are rejected with a 400
+_CONTENT_TAGS_MAX_PAGES = 34  # ~1000 tags, mirroring the article cap
+_CONTENT_TAGS_MAX_RESULTS = _CONTENT_TAGS_PAGE_SIZE * _CONTENT_TAGS_MAX_PAGES
+
+
+@mcp.tool()
+def list_content_tags() -> str:
+    """List all Help Center content tags.
+
+    The endpoint is cursor-paginated at 30 per page, so this walks the cursor to gather the full set.
+    Retries 429s with Retry-After backoff. Stops after 34 requests (1020 content tags).
+
+    Returns:
+        A JSON object of content tags. Each content tag has fields for ID and name. Includes a warning
+        naming the reason whenever the result set was cut short.
+
+    See https://developer.zendesk.com/api-reference/help_center/help-center-api/content_tags/ for the endpoint spec.
+    """
+    params: dict = {"page[size]": _CONTENT_TAGS_PAGE_SIZE}
+    content_tags = []
+    truncated_by: str | None = None
+    pages = 0
+    while True:
+        data = _get_with_retry("/guide/content_tags", params=params)
+        pages += 1
+        for content_tag in data.get("records", []):
+            content_tags.append(
+                {
+                    "id": content_tag["id"],
+                    "name": content_tag.get("name", ""),
+                }
+            )
+        meta = data.get("meta", {})
+        if not meta.get("has_more"):
+            break
+        if not meta.get("after_cursor"):
+            truncated_by = "a missing cursor in the Zendesk response"
+            break
+        if pages >= _CONTENT_TAGS_MAX_PAGES:
+            truncated_by = (
+                f"the request cap ({_CONTENT_TAGS_MAX_PAGES} pages, "
+                f"{_CONTENT_TAGS_MAX_RESULTS} content tags)"
+            )
+            break
+        params["page[after]"] = meta["after_cursor"]
+
+    if not content_tags:
+        return "No content tags found."
+
+    out: dict = {
+        "returned_count": len(content_tags),
+        "content_tags": content_tags,
+    }
+    if truncated_by:
+        out["warning"] = (
+            f"Result set incomplete — stopped by {truncated_by}; more content tags exist."
         )
     return json.dumps(out, indent=2)
 
