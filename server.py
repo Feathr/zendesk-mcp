@@ -3,13 +3,14 @@
 Access levels controlled by ACCESS_LEVEL env var:
     readonly   — search/read/count/export tickets, users, views, orgs, audits, bulk read,
         attachments, articles (18 tools)
-    management — readonly + create/update tickets, comments, tags (23 tools)
-    admin      — management + user/org CRUD, merge, bulk ops, delete (32 tools)
+    management — readonly + create/update tickets, comments, tags, file attachments (24 tools)
+    admin      — management + user/org CRUD, merge, bulk ops, delete (33 tools)
 """
 
 import base64
 import json
 import math
+import mimetypes
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -91,6 +92,31 @@ def _post(path: str, json_body: dict) -> dict:
     resp = _client.post(path, json=json_body)
     resp.raise_for_status()
     return resp.json()
+
+
+_UPLOAD_TIMEOUT_SECONDS = 120.0
+
+
+def _post_upload(filename: str, content: bytes, content_type: str) -> dict:
+    """Upload raw file bytes to Zendesk's uploads endpoint. Raises on HTTP errors.
+
+    Args:
+        filename: Name the attachment will have in Zendesk.
+        content: The file's bytes.
+        content_type: MIME type sent as the request's Content-Type.
+
+    Returns:
+        The "upload" object from the response, including its "token".
+    """
+    resp = _client.post(
+        "/uploads.json",
+        params={"filename": filename},
+        content=content,
+        headers={"Content-Type": content_type},
+        timeout=_UPLOAD_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return resp.json()["upload"]
 
 
 def _put(path: str, json_body: dict) -> dict:
@@ -1160,6 +1186,41 @@ def list_content_tags() -> str:
 # Ticket Management Tools (management + admin)
 # ---------------------------------------------------------------------------
 
+_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024  # Zendesk's per-file attachment limit
+
+
+def _resolve_attachment_paths(file_paths: list[str]) -> list[Path]:
+    """Expand and validate local files before any of them are uploaded.
+
+    Args:
+        file_paths: Paths as given by the caller; "~" is expanded.
+
+    Returns:
+        Resolved paths, in the order given.
+
+    Raises:
+        ValueError: If no paths are given, or any path is missing, not a regular
+            file, or larger than the attachment limit.
+    """
+    if not file_paths:
+        raise ValueError("file_paths must contain at least one path.")
+    resolved: list[Path] = []
+    problems: list[str] = []
+    for raw_path in file_paths:
+        path = Path(raw_path).expanduser().resolve()
+        if not path.is_file():
+            problems.append(f"{raw_path}: not found or not a regular file")
+            continue
+        size = path.stat().st_size
+        if size > _ATTACHMENT_MAX_BYTES:
+            problems.append(f"{raw_path}: {size / 1024 / 1024:.1f} MB exceeds the 50 MB limit")
+            continue
+        resolved.append(path)
+    if problems:
+        raise ValueError("Nothing was uploaded. " + "; ".join(problems))
+    return resolved
+
+
 if ACCESS_LEVEL in ("management", "admin"):
 
     @mcp.tool()
@@ -1325,6 +1386,63 @@ if ACCESS_LEVEL in ("management", "admin"):
         updated = [t for t in current_tags if t not in tags]
         data = _put(f"/tickets/{ticket_id}.json", {"ticket": {"tags": updated}})
         return json.dumps({"id": ticket_id, "tags": data["ticket"].get("tags", [])}, indent=2)
+
+    @mcp.tool()
+    def attach_file_to_ticket(
+        ticket_id: int,
+        file_paths: list[str],
+        comment: str,
+        public: bool = False,
+    ) -> str:
+        """Attach one or more local files to a ticket in a single new comment.
+
+        Reads each file from the local machine running this server, uploads it to
+        Zendesk, and adds one comment to the ticket carrying all the attachments.
+        Defaults to an internal note; set public=True only when the requester should
+        receive the files. All paths are checked before anything is uploaded, so a bad
+        path fails without posting a partial comment. Files over 50 MB are rejected
+        (Zendesk's attachment limit).
+
+        Args:
+            ticket_id: The ticket to attach the files to.
+            file_paths: Local file paths to attach. Absolute paths or paths starting
+                with "~" are safest; relative paths resolve against the server's working directory.
+            comment: Comment text posted with the attachments. Zendesk requires a
+                comment to carry attachments, so this cannot be empty.
+            public: True for a public reply (visible to requester), False for an internal note.
+        """
+        if not comment.strip():
+            raise ValueError("comment must not be empty; Zendesk attaches files via a comment.")
+        files = _resolve_attachment_paths(file_paths)
+
+        tokens: list[str] = []
+        attachments: list[dict] = []
+        for path in files:
+            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            content = path.read_bytes()
+            upload = _post_upload(path.name, content, content_type)
+            tokens.append(upload["token"])
+            attachments.append(
+                {
+                    "file_name": path.name,
+                    "size_bytes": len(content),
+                    "content_type": content_type,
+                }
+            )
+
+        data = _put(
+            f"/tickets/{ticket_id}.json",
+            {"ticket": {"comment": {"body": comment, "public": public, "uploads": tokens}}},
+        )
+        return json.dumps(
+            {
+                "ticket_id": data["ticket"]["id"],
+                "status": data["ticket"]["status"],
+                "public": public,
+                "attachments": attachments,
+            },
+            indent=2,
+        )
 
 
 # ---------------------------------------------------------------------------
