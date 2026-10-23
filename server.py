@@ -2,9 +2,9 @@
 
 Access levels controlled by ACCESS_LEVEL env var:
     readonly   — search/read/count/export tickets, users, views, orgs, audits, bulk read,
-        attachments, articles (17 tools)
-    management — readonly + create/update tickets, comments, tags (22 tools)
-    admin      — management + user/org CRUD, merge, bulk ops, delete (31 tools)
+        attachments, articles (18 tools)
+    management — readonly + create/update tickets, comments, tags (23 tools)
+    admin      — management + user/org CRUD, merge, bulk ops, delete (32 tools)
 """
 
 import base64
@@ -445,7 +445,9 @@ def get_ticket_comments(ticket_id: int) -> str:
     """Get all comments (replies) on a Zendesk ticket, in chronological order.
 
     Follows Zendesk's `next_page` pagination so long threads (>100 comments)
-    are returned in full.
+    are returned in full. Threads over ~1 MB of projected JSON are refused with
+    an `error` instead of being returned inline; use `export_ticket_comments`
+    to write those to a local file.
 
     Each comment includes:
     - `links`: anchor URLs extracted from html_body (recovers triage URLs that
@@ -454,14 +456,43 @@ def get_ticket_comments(ticket_id: int) -> str:
     - `attachments`: filename, url, content_type, size for each attachment.
 
     To fetch attachment content, use `fetch_attachment(url)`.
+
+    Args:
+        ticket_id: The Zendesk ticket ID.
     """
-    comments: list = []
-    url: str | None = f"/tickets/{ticket_id}/comments.json"
-    while url:
-        data = _get(url)
-        comments.extend(_project_comment(c) for c in data.get("comments", []))
-        url = data.get("next_page")
+    try:
+        comments = _fetch_comments(ticket_id, max_bytes=_COMMENTS_INLINE_MAX_BYTES)
+    except _CommentThreadTooLarge as exc:
+        return json.dumps(exc.to_error(), indent=2)
     return json.dumps(comments, indent=2)
+
+
+@mcp.tool()
+def export_ticket_comments(ticket_id: int, output_path: str) -> str:
+    """Write all comments on a ticket to a local JSON file instead of returning them.
+
+    Use this for threads too large for `get_ticket_comments` (e.g. a bot
+    ticket that has accumulated thousands of notices), then process the file
+    with a script rather than reading it into context. The file holds a
+    compact JSON array in the same per-comment shape as `get_ticket_comments`.
+    An existing file at `output_path` is overwritten; parent directories are
+    created. Retries 429s with Retry-After backoff.
+
+    Args:
+        ticket_id: The Zendesk ticket ID.
+        output_path: Absolute path of the JSON file to write (`~` is expanded).
+
+    Returns:
+        JSON with `path`, `comment_count`, and `bytes` written, or an `error`.
+    """
+    path = Path(output_path).expanduser()
+    if not path.is_absolute():
+        return json.dumps({"error": "output_path must be an absolute path."})
+    comments = _fetch_comments(ticket_id, max_bytes=None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(comments))
+    result = {"path": str(path), "comment_count": len(comments), "bytes": path.stat().st_size}
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -600,13 +631,61 @@ def get_ticket_audits(ticket_id: int) -> str:
     return json.dumps(audits, indent=2)
 
 
-def _fetch_comments_with_retry(ticket_id: int) -> list[dict]:
-    """Fetch all comments for one ticket, paginated, with 429 backoff."""
+# Inline comment responses are capped well below the MCP client's 16 MB
+# per-message limit; JSON-RPC string escaping inflates them further in transit.
+_COMMENTS_INLINE_MAX_BYTES = 1_000_000
+_BULK_COMMENTS_MAX_BYTES = 4_000_000
+
+
+class _CommentThreadTooLarge(Exception):
+    """Raised when a ticket's comment thread exceeds the inline byte budget."""
+
+    def __init__(self, ticket_id: int, fetched: int, total: int | None):
+        super().__init__(f"Ticket {ticket_id} comment thread exceeds the inline size limit.")
+        self.ticket_id = ticket_id
+        self.fetched = fetched
+        self.total = total
+
+    def to_error(self) -> dict:
+        """Build the structured error returned to the MCP caller.
+
+        Returns:
+            Dict with `error`, `ticket_id`, comment counts, and a `hint`.
+        """
+        return {
+            "error": str(self),
+            "ticket_id": self.ticket_id,
+            "comments_fetched_before_stop": self.fetched,
+            "total_comments": self.total,
+            "hint": "Use export_ticket_comments to write the thread to a local file.",
+        }
+
+
+def _fetch_comments(ticket_id: int, max_bytes: int | None) -> list[dict]:
+    """Fetch all comments for one ticket, paginated, with 429 backoff.
+
+    Args:
+        ticket_id: The Zendesk ticket ID.
+        max_bytes: Stop after the page that pushes the projected JSON past this
+            many bytes. None fetches the whole thread.
+
+    Returns:
+        Projected comments in chronological order.
+
+    Raises:
+        _CommentThreadTooLarge: The thread exceeds `max_bytes`.
+    """
     comments: list[dict] = []
+    total_bytes = 0
     url: str | None = f"/tickets/{ticket_id}/comments.json"
     while url:
         data = _get_with_retry(url)
-        comments.extend(_project_comment(c) for c in data.get("comments", []))
+        for raw_comment in data.get("comments", []):
+            projected = _project_comment(raw_comment)
+            comments.append(projected)
+            total_bytes += len(json.dumps(projected))
+        if max_bytes is not None and total_bytes > max_bytes:
+            raise _CommentThreadTooLarge(ticket_id, len(comments), data.get("count"))
         url = data.get("next_page")
     return comments
 
@@ -621,6 +700,11 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
     `get_ticket_comments` (links, images, attachments included). Follows
     pagination per ticket and retries 429s with Retry-After backoff.
 
+    A ticket whose thread is over ~1 MB lands in `errors` (fetch it with
+    `export_ticket_comments`). If the combined response would exceed ~4 MB,
+    only an `error` and per-ticket `comment_counts` are returned; retry with
+    fewer ticket_ids.
+
     Args:
         ticket_ids: List of ticket IDs to fetch (max 200).
         max_concurrency: Maximum simultaneous Zendesk requests (1–20, default 8).
@@ -633,7 +717,9 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
     results: dict[str, list] = {}
     errors: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_fetch_comments_with_retry, tid): tid for tid in ticket_ids}
+        futures = {
+            ex.submit(_fetch_comments, tid, _COMMENTS_INLINE_MAX_BYTES): tid for tid in ticket_ids
+        }
         for fut in as_completed(futures):
             tid = futures[fut]
             try:
@@ -644,7 +730,16 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
     out: dict = {"comments_by_ticket": results}
     if errors:
         out["errors"] = errors
-    return json.dumps(out, indent=2)
+    serialized = json.dumps(out, indent=2)
+    if len(serialized) <= _BULK_COMMENTS_MAX_BYTES:
+        return serialized
+    oversized: dict = {
+        "error": "Combined comments exceed the inline size limit; request fewer ticket_ids.",
+        "comment_counts": {tid: len(comments) for tid, comments in results.items()},
+    }
+    if errors:
+        oversized["errors"] = errors
+    return json.dumps(oversized, indent=2)
 
 
 _IMAGE_FORMAT_ALLOWLIST = {"png", "jpeg", "gif", "webp"}
