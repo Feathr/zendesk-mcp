@@ -6,9 +6,9 @@ A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk
 
 | Level | Tools | Who should use it |
 |-------|-------|-------------------|
-| **readonly** | Search/read/count/export tickets, users, views, orgs, audits, bulk reads, attachments, articles (18 tools) | Everyone |
-| **management** | readonly + create/update tickets, comments, tags, file attachments (24 tools) | Team leads, support agents |
-| **admin** | management + user/org CRUD, merge, bulk ops, delete (33 tools) | Zendesk admins only |
+| **readonly** | Search/read/count/export tickets, users, views, orgs, audits, bulk reads, attachments, articles (19 tools) | Everyone |
+| **management** | readonly + create/update tickets, comments, tags, file attachments (25 tools) | Team leads, support agents |
+| **admin** | management + user/org CRUD, merge, bulk ops, delete (34 tools) | Zendesk admins only |
 
 ## Available Tools
 
@@ -31,6 +31,7 @@ A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk
 - `list_user_segments` — List the user segments applicable to the current Guide plan (ID, name, user type, and tag rules)
 - `list_categories_and_sections` — List Help Center sections grouped by their parent category (ID, name, and html_url)
 - `list_content_tags` — List Help Center content tags (ID and name)
+- `list_article_requests` — List Help Center change requests found in tickets tagged with help_center_for_claude (oldest first, 100 max)
 
 ### Ticket Management (management + admin)
 - `create_ticket` — Create a new ticket
@@ -106,6 +107,8 @@ cp ~/.claude/mcp-servers/zendesk/.env.example ~/.claude/mcp-servers/zendesk/.env
 ```
 
 Then edit `~/.claude/mcp-servers/zendesk/.env` and set `ACCESS_LEVEL` to the value from Step 1.
+
+`ZENDESK_HELP_CENTER_HOST` is required: set it to your branded Help Center domain (the example uses `help.feathr.co`) so list_article_requests recognizes article links on that domain. If your Help Center only lives at `<subdomain>.zendesk.com`, set it to that.
 
 **For the API key:** Tell the user:
 

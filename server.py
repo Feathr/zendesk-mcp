@@ -2,9 +2,9 @@
 
 Access levels controlled by ACCESS_LEVEL env var:
     readonly   — search/read/count/export tickets, users, views, orgs, audits, bulk read,
-        attachments, articles (18 tools)
-    management — readonly + create/update tickets, comments, tags, file attachments (24 tools)
-    admin      — management + user/org CRUD, merge, bulk ops, delete (33 tools)
+        attachments, articles (19 tools)
+    management — readonly + create/update tickets, comments, tags, file attachments (25 tools)
+    admin      — management + user/org CRUD, merge, bulk ops, delete (34 tools)
 """
 
 import base64
@@ -12,6 +12,7 @@ import json
 import math
 import mimetypes
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
@@ -28,6 +29,9 @@ load_dotenv(Path(__file__).parent / ".env")
 SUBDOMAIN = os.environ["ZENDESK_SUBDOMAIN"]
 EMAIL = os.environ["ZENDESK_EMAIL"]
 API_KEY = os.environ["ZENDESK_API_KEY"]
+# Branded Help Center host (e.g. help.example.com). Zendesk also serves the Help Center under the
+# raw subdomain, so article links on either host are recognized.
+HELP_CENTER_HOST = os.environ["ZENDESK_HELP_CENTER_HOST"].lower()
 ACCESS_LEVEL = os.environ.get("ACCESS_LEVEL", "readonly").lower()
 
 if ACCESS_LEVEL not in ("readonly", "management", "admin"):
@@ -716,6 +720,35 @@ def _fetch_comments(ticket_id: int, max_bytes: int | None) -> list[dict]:
     return comments
 
 
+def _fetch_comments_bulk(
+    ticket_ids: list[int], max_bytes: int | None, max_concurrency: int = 8
+) -> tuple[dict[int, list[dict]], dict[int, str]]:
+    """Fetch comments for many tickets in parallel, at 1–20 simultaneous requests.
+
+    Each ticket's thread is capped at max_bytes, as in _fetch_comments.
+
+    Returns a pair of (comments by ticket ID, errors by ticket ID). A ticket that could not be
+    fetched appears only in errors, with its failure message.
+    """
+    workers = max(1, min(max_concurrency, 20))
+    comments_by_ticket: dict[int, list[dict]] = {}
+    errors: dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_fetch_comments, ticket_id, max_bytes): ticket_id
+            for ticket_id in ticket_ids
+        }
+        for future in as_completed(futures):
+            ticket_id = futures[future]
+            try:
+                comments = future.result()
+            except Exception as exception:  # noqa: BLE001 — one failed ticket must not kill the batch
+                errors[ticket_id] = str(exception)
+                continue
+            comments_by_ticket[ticket_id] = comments
+    return comments_by_ticket, errors
+
+
 @mcp.tool()
 def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) -> str:
     """Bulk-fetch comments for many tickets in parallel.
@@ -738,20 +771,17 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
     if len(ticket_ids) > 200:
         return json.dumps({"error": "Maximum 200 tickets per bulk fetch."})
 
-    workers = max(1, min(max_concurrency, 20))
+    comments_by_ticket, fetch_errors = _fetch_comments_bulk(
+        ticket_ids, _COMMENTS_INLINE_MAX_BYTES, max_concurrency
+    )
 
     results: dict[str, list] = {}
+    for ticket_id, comments in comments_by_ticket.items():
+        results[str(ticket_id)] = comments
+
     errors: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {
-            ex.submit(_fetch_comments, tid, _COMMENTS_INLINE_MAX_BYTES): tid for tid in ticket_ids
-        }
-        for fut in as_completed(futures):
-            tid = futures[fut]
-            try:
-                results[str(tid)] = fut.result()
-            except Exception as exc:  # noqa: BLE001 — one failed ticket must not kill the batch
-                errors[str(tid)] = str(exc)
+    for ticket_id, message in fetch_errors.items():
+        errors[str(ticket_id)] = message
 
     out: dict = {"comments_by_ticket": results}
     if errors:
@@ -1179,6 +1209,132 @@ def list_content_tags() -> str:
         out["warning"] = (
             f"Result set incomplete — stopped by {truncated_by}; more content tags exist."
         )
+    return json.dumps(out, indent=2)
+
+
+_ARTICLE_HOSTS = (HELP_CENTER_HOST, f"{SUBDOMAIN}.zendesk.com")
+_ARTICLE_PATH_PATTERN = re.compile(r"^/hc/(?:[^/]+/)?articles/(\d+)")
+
+
+def _extract_article_id(url: str) -> int | None:
+    """Return the article ID from a URL, or None if it isn't an article URL on this Help Center."""
+    try:
+        parsed_url = urlparse(url)
+    except ValueError:
+        return None
+    if parsed_url.hostname not in _ARTICLE_HOSTS:
+        return None
+    # Article paths end in "<id>-slugified-title", or a bare "<id>"
+    match = _ARTICLE_PATH_PATTERN.match(parsed_url.path)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _extract_form_field(body: str, label_prefix: str) -> str:
+    """Pull one field's value out of a request form submission.
+
+    Each field in the markdown body is a bold label line with its value on the next line, so this
+    returns the line after the first label starting with label_prefix (lowercased, asterisks
+    ignored). Empty string when no label matches or the field was left blank.
+    """
+    label_found = False
+    field_value: str = ""
+    for line in body.splitlines():
+        stripped_line = line.strip()
+        if not label_found:
+            label = stripped_line.strip("*").strip().lower()
+            label_found = label.startswith(label_prefix.lower())
+            continue
+        field_value = line
+        break
+    return field_value.strip()
+
+
+_ARTICLE_REQUESTS_TAG = "help_center_for_claude"
+_TARGET_ARTICLE_FIELD_LABEL = "existing article url"
+_ARTICLE_REQUESTS_MAX_RESULTS = 100  # one search page; the tool does not paginate
+
+
+@mcp.tool()
+def list_article_requests(max_results: int = 100) -> str:
+    """List Help Center change requests found in Zendesk tickets.
+
+    Parses each ticket tagged help_center_for_claude, oldest first, from one search page (100
+    tickets max). Retries 429s with Retry-After backoff.
+
+    Args:
+        max_results: Maximum number of tagged tickets to inspect. Default and maximum are 100.
+
+    Returns:
+        A JSON object with a list of requests. Each request has ticket_id, target_article_id (the
+        article to edit; the request form allows a single link), request (the plain text of the
+        first comment), other_comments (the plain text of every later comment), and other_links
+        (every other http(s) link in the ticket). A null target_article_id means the request is for
+        a new article, unless the ticket is listed in errors.
+        Includes errors (ticket ID → message) for tickets whose comments could not be fetched or
+        were empty, or whose target field isn't a Help Center article URL. Includes a warning when
+        max_results or the 100-ticket page cuts the result set short; omitted tickets are newer.
+        "No article requests found." when no tickets are tagged.
+
+    See https://developer.zendesk.com/api-reference/ticketing/ticket-management/search/ for the endpoint spec.
+    """
+    limit = max(1, min(max_results, _ARTICLE_REQUESTS_MAX_RESULTS))
+    params: dict = {
+        "query": f"type:ticket tags:{_ARTICLE_REQUESTS_TAG}",
+        "sort_by": "created_at",
+        "sort_order": "asc",
+    }
+    data = _get_with_retry("/search.json", params=params)
+    results = data.get("results", [])
+    if not results:
+        return "No article requests found."
+
+    ticket_ids = [ticket["id"] for ticket in results[:limit]]
+    comments_by_ticket, errors = _fetch_comments_bulk(ticket_ids, _COMMENTS_INLINE_MAX_BYTES)
+
+    requests: list[dict] = []
+    for ticket_id in ticket_ids:
+        comments = comments_by_ticket.get(ticket_id, [])
+        if not comments:
+            errors.setdefault(ticket_id, "Ticket returned no comments.")
+            continue
+
+        target_article_url = _extract_form_field(comments[0]["body"], _TARGET_ARTICLE_FIELD_LABEL)
+        target_article_id = _extract_article_id(target_article_url)
+        if target_article_url and target_article_id is None:
+            errors[ticket_id] = (
+                f"Target field is not a Help Center article URL: {target_article_url}"
+            )
+
+        other_links: list[str] = []
+        for comment in comments:
+            for link in comment["links"]:
+                link_url = link["url"]
+                if (
+                    not link_url.lower().startswith(("http://", "https://"))
+                    or link_url == target_article_url
+                    or link_url in other_links
+                ):
+                    continue
+                other_links.append(link_url)
+
+        requests.append(
+            {
+                "ticket_id": ticket_id,
+                "target_article_id": target_article_id,
+                "request": comments[0]["plain_body"],
+                "other_comments": [comment["plain_body"] for comment in comments[1:]],
+                "other_links": other_links,
+            }
+        )
+
+    out: dict = {"requests": requests}
+    if errors:
+        out["errors"] = {str(ticket_id): message for ticket_id, message in errors.items()}
+    total_count = data.get("count", len(results))
+    if len(ticket_ids) < total_count:
+        out["warning"] = f"Showing the {len(ticket_ids)} oldest of {total_count} tagged tickets."
     return json.dumps(out, indent=2)
 
 

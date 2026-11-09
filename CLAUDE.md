@@ -23,7 +23,8 @@ built on `FastMCP` and `httpx`.
   merge, bulk ops, delete). Gating is done with `if ACCESS_LEVEL ...` blocks around the
   `@mcp.tool()` registrations — a tool that isn't registered can't be called.
 - Configuration comes from `.env` next to `server.py`: `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`,
-  `ZENDESK_API_KEY`, `ACCESS_LEVEL`. Missing required vars fail at import — keep it that way.
+  `ZENDESK_API_KEY`, `ACCESS_LEVEL`, and `ZENDESK_HELP_CENTER_HOST` (branded Help
+  Center domain). Missing required vars fail at import — keep it that way.
 
 ## Detected Tooling
 
