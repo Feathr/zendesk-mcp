@@ -41,7 +41,6 @@ mcp = FastMCP("zendesk")
 
 _client = httpx.Client(
     base_url=BASE_URL,
-    auth=(f"{EMAIL}/token", API_KEY),
     timeout=30.0,
     headers={"Accept": "application/json"},
 )
@@ -51,10 +50,23 @@ _client = httpx.Client(
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
+# Admits httpx.Auth so a later change can return a bearer-token auth object without new annotations.
+ZendeskAuth = tuple[str, str] | httpx.Auth
+
+
+def _zendesk_auth() -> ZendeskAuth:
+    """Return the credentials to send with the current Zendesk request.
+
+    Returns:
+        The basic-auth tuple ``("<email>/token", api_key)``. A later change will return the
+        caller's bearer token when the server runs over HTTP; call sites must not change.
+    """
+    return (f"{EMAIL}/token", API_KEY)
+
 
 def _get(path: str, params: dict | None = None) -> dict:
     """Make a GET request to Zendesk API. Raises on HTTP errors."""
-    resp = _client.get(path, params=params)
+    resp = _client.get(path, params=params, auth=_zendesk_auth())
     resp.raise_for_status()
     return resp.json()
 
@@ -63,16 +75,32 @@ _RETRY_MAX_ATTEMPTS = 3
 _RETRY_MAX_BACKOFF_SECONDS = 30
 
 
-def _get_with_retry(path: str, params: dict | None = None) -> dict:
+def _get_with_retry(
+    path: str, params: dict | None = None, *, auth: ZendeskAuth | None = None
+) -> dict:
     """GET with capped 429 backoff. Honors Zendesk's Retry-After header.
 
     Sleeps at most _RETRY_MAX_BACKOFF_SECONDS per attempt, with capped
     attempts so a sustained-429 storm fails fast instead of stalling.
     Use for loops that issue many requests against rate-limited endpoints.
+
+    Args:
+        path: API path relative to the base URL, or an absolute `next_page` URL.
+        params: Query parameters, if any.
+        auth: Credentials to send. Worker threads must pass the caller's credentials,
+            resolved in the calling thread; None resolves them here with `_zendesk_auth()`.
+
+    Returns:
+        The parsed JSON response.
+
+    Raises:
+        httpx.HTTPStatusError: The final attempt returned an error status (including a 429 after
+            the last retry).
     """
+    request_auth = _zendesk_auth() if auth is None else auth
     data: dict = {}
     for attempt in range(_RETRY_MAX_ATTEMPTS):
-        resp = _client.get(path, params=params)
+        resp = _client.get(path, params=params, auth=request_auth)
         if resp.status_code == 429 and attempt < _RETRY_MAX_ATTEMPTS - 1:
             retry_after = resp.headers.get("retry-after", "5")
             try:
@@ -89,7 +117,7 @@ def _get_with_retry(path: str, params: dict | None = None) -> dict:
 
 def _post(path: str, json_body: dict) -> dict:
     """Make a POST request to Zendesk API. Raises on HTTP errors."""
-    resp = _client.post(path, json=json_body)
+    resp = _client.post(path, json=json_body, auth=_zendesk_auth())
     resp.raise_for_status()
     return resp.json()
 
@@ -114,6 +142,7 @@ def _post_upload(filename: str, content: bytes, content_type: str) -> dict:
         content=content,
         headers={"Content-Type": content_type},
         timeout=_UPLOAD_TIMEOUT_SECONDS,
+        auth=_zendesk_auth(),
     )
     resp.raise_for_status()
     return resp.json()["upload"]
@@ -121,14 +150,14 @@ def _post_upload(filename: str, content: bytes, content_type: str) -> dict:
 
 def _put(path: str, json_body: dict) -> dict:
     """Make a PUT request to Zendesk API. Raises on HTTP errors."""
-    resp = _client.put(path, json=json_body)
+    resp = _client.put(path, json=json_body, auth=_zendesk_auth())
     resp.raise_for_status()
     return resp.json()
 
 
 def _delete(path: str) -> str:
     """Make a DELETE request to Zendesk API. Raises on HTTP errors."""
-    resp = _client.delete(path)
+    resp = _client.delete(path, auth=_zendesk_auth())
     resp.raise_for_status()
     return "Deleted successfully."
 
@@ -687,13 +716,17 @@ class _CommentThreadTooLarge(Exception):
         }
 
 
-def _fetch_comments(ticket_id: int, max_bytes: int | None) -> list[dict]:
+def _fetch_comments(
+    ticket_id: int, max_bytes: int | None, *, auth: ZendeskAuth | None = None
+) -> list[dict]:
     """Fetch all comments for one ticket, paginated, with 429 backoff.
 
     Args:
         ticket_id: The Zendesk ticket ID.
         max_bytes: Stop after the page that pushes the projected JSON past this
             many bytes. None fetches the whole thread.
+        auth: Credentials to send. Pass the caller's when running in a worker thread;
+            None resolves them with `_zendesk_auth()` in the current thread.
 
     Returns:
         Projected comments in chronological order.
@@ -705,7 +738,7 @@ def _fetch_comments(ticket_id: int, max_bytes: int | None) -> list[dict]:
     total_bytes = 0
     url: str | None = f"/tickets/{ticket_id}/comments.json"
     while url:
-        data = _get_with_retry(url)
+        data = _get_with_retry(url, auth=auth)
         for raw_comment in data.get("comments", []):
             projected = _project_comment(raw_comment)
             comments.append(projected)
@@ -742,9 +775,12 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
 
     results: dict[str, list] = {}
     errors: dict[str, str] = {}
+    # Resolved here: contextvars do not carry into executor threads by default.
+    caller_auth = _zendesk_auth()
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {
-            ex.submit(_fetch_comments, tid, _COMMENTS_INLINE_MAX_BYTES): tid for tid in ticket_ids
+            ex.submit(_fetch_comments, tid, _COMMENTS_INLINE_MAX_BYTES, auth=caller_auth): tid
+            for tid in ticket_ids
         }
         for fut in as_completed(futures):
             tid = futures[fut]
@@ -805,7 +841,7 @@ def fetch_attachment(url: str, max_size_mb: int = 10):
     with httpx.stream(
         "GET",
         url,
-        auth=(f"{EMAIL}/token", API_KEY),
+        auth=_zendesk_auth(),
         timeout=60.0,
         follow_redirects=False,
     ) as resp:

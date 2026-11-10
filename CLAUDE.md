@@ -32,11 +32,13 @@ built on `FastMCP` and `httpx`.
 | Format   | `uvx ruff format .`      |
 | Lint     | `uvx ruff check .`       |
 | Lint Fix | `uvx ruff check --fix .` |
+| Test     | `uv run --isolated --no-project --with-requirements requirements.txt --with pytest python -m pytest tests -q -p no:cacheprovider` |
 
 Ruff is configured in `pyproject.toml`: line length 100 (119 for comments/docstrings),
 target py310, rules B (bugbear), I (isort), E (pycodestyle), max complexity 10.
-Run format + lint before proposing any PR. There is no test suite; review rigor and
-manual verification against a real Zendesk instance stand in for it.
+Run format + lint + tests before proposing any PR. `tests/` holds a small offline suite (HTTP
+stubbed, no `.env` needed); run it with the Test command above. It does not replace manual
+verification against a real Zendesk instance, which is still required.
 
 ## Code Style
 
