@@ -2,6 +2,7 @@
 
 Values are assigned directly (not `setdefault`) so they win over a real `.env`:
 `server.py` calls `load_dotenv` with `override=False`, which keeps variables that are already set.
+`MCP_TRANSPORT` is pinned to stdio so a developer `.env` cannot load the suite in HTTP mode.
 """
 
 import os
@@ -12,3 +13,4 @@ os.environ["ZENDESK_API_KEY"] = "env-key"
 # Set so the suite keeps importing if this var becomes required.
 os.environ["ZENDESK_HELP_CENTER_HOST"] = "help.example.com"
 os.environ["ACCESS_LEVEL"] = "readonly"
+os.environ["MCP_TRANSPORT"] = "stdio"

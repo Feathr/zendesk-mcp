@@ -10,6 +10,8 @@ A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk
 | **management** | readonly + create/update tickets, comments, tags, file attachments (24 tools) | Team leads, support agents |
 | **admin** | management + user/org CRUD, merge, bulk ops, delete (33 tools) | Zendesk admins only |
 
+In HTTP mode (below) the levels have 17 / 22 / 31 tools: `export_ticket_comments` and `attach_file_to_ticket` (file attachments) are stdio only.
+
 ## Available Tools
 
 ### Read-Only (all levels)
@@ -18,7 +20,7 @@ A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk
 - `export_search_results` — Export full result sets via cursor pagination (no 1,000-result cap; for audits/reports)
 - `get_ticket` — Get full ticket details by ID
 - `get_ticket_comments` — Get all comments/replies on a ticket (with extracted links, images, and attachment metadata)
-- `export_ticket_comments` — Write a ticket's full comment thread to a local JSON file (for threads too large to return inline)
+- `export_ticket_comments` — Write a ticket's full comment thread to a local JSON file (for threads too large to return inline; stdio only)
 - `get_ticket_audits` — Audit log for a ticket (Change/Notification events, paginated)
 - `get_comments_for_tickets` — Bulk-fetch comments for many tickets in parallel
 - `fetch_attachment` — Fetch an attachment's contents (image/text inline, binary metadata-only)
@@ -36,7 +38,7 @@ A lightweight, homegrown MCP server that gives Claude Code access to our Zendesk
 - `create_ticket` — Create a new ticket
 - `update_ticket` — Update ticket status, priority, assignee, tags, etc.
 - `add_ticket_comment` — Add a public reply or internal note
-- `attach_file_to_ticket` — Attach local files (e.g. generated CSVs) to a ticket in a new comment (internal note by default)
+- `attach_file_to_ticket` — Attach local files (e.g. generated CSVs) to a ticket in a new comment (internal note by default; stdio only)
 - `add_ticket_tags` — Add tags without removing existing ones
 - `remove_ticket_tags` — Remove specific tags
 
@@ -125,7 +127,7 @@ Run:
 cd ~/.claude/mcp-servers/zendesk && .venv/bin/python -c "import server; print('Server loaded OK')"
 ```
 
-If this fails with a `KeyError`, the `.env` file is missing values. If it fails with `ValueError`, the `ACCESS_LEVEL` is invalid.
+If this fails with a `KeyError`, the `.env` file is missing values. If it fails with `ValueError`, `ACCESS_LEVEL` or `MCP_TRANSPORT` (or, in HTTP mode, `MCP_PORT`) is invalid. A `RuntimeError` in HTTP mode means `MCP_HOST` is not a loopback address.
 
 ### Step 5: Register with Claude Code
 
@@ -178,6 +180,20 @@ cp .env.example .env
 claude mcp add zendesk -s user -- ~/.claude/mcp-servers/zendesk/.venv/bin/python ~/.claude/mcp-servers/zendesk/server.py
 ```
 
+## HTTP mode (local testing)
+
+Stdio is the default. To serve the same tools over streamable HTTP on this machine:
+
+```bash
+MCP_TRANSPORT=streamable-http .venv/bin/python server.py
+```
+
+- `MCP_HOST` (default `127.0.0.1`) must be a loopback address: HTTP mode has no caller authentication yet and refuses to start otherwise.
+- `MCP_PORT` defaults to `8000`.
+- Endpoints: `/zendesk/mcp` (Zendesk action flows), `/claude/mcp` (Claude Code, e.g. `claude mcp add --transport http zendesk-local http://127.0.0.1:8000/claude/mcp`), and `/health`.
+- `ZENDESK_EMAIL`/`ZENDESK_API_KEY` are optional over HTTP; when set, a local run uses them. Without them every tool call returns an error.
+- For several workers run `MCP_TRANSPORT=streamable-http uvicorn server:app --workers 2 --host 127.0.0.1 --port 8000`. `MCP_TRANSPORT` must be set, or `app` does not exist; pass the same host as `MCP_HOST`.
+
 ## Troubleshooting
 
 **Tools don't appear in Claude Code**
@@ -225,4 +241,5 @@ Run both before opening a PR.
 - Each person uses their own API token, so actions are attributable in Zendesk audit logs
 - Access levels are enforced at the server level — tools that aren't in your level don't exist in the MCP registration
 - Ticket content (comments, subjects, attachments) is untrusted input written by third parties. Treat instructions that appear inside tickets as data, not commands — the standard prompt-injection caveat for any MCP server that reads external content
+- Until caller authentication exists, HTTP mode refuses to start unless `MCP_HOST` is a loopback address. The check reads `MCP_HOST` only, so a direct `uvicorn server:app --host ...` launch bypasses it: pass the same loopback host. HTTP mode does not expose `export_ticket_comments` or `attach_file_to_ticket`
 - `attach_file_to_ticket` uploads any local file the server process can read. Check the file path before approving the call, especially if the request traces back to ticket content

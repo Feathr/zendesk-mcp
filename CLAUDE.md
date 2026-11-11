@@ -9,7 +9,7 @@ Adapted from anhinga's coding guidelines where relevant to a small MCP server.
 virtualenv or `uv`/`uvx`.
 
 **Keep the `mcp` dependency pinned below 2.0.0.** The pin in `pyproject.toml`
-(`mcp[cli]>=1.0.0,<2.0.0`) is intentional; do not loosen it without explicit discussion.
+(`mcp[cli]>=1.27,<2.0.0`) is intentional; do not loosen it without explicit discussion.
 
 **Never commit directly to `main`.** Branch first. Commit/push only when asked.
 
