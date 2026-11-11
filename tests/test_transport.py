@@ -7,17 +7,21 @@ The copy lives in a temp dir, so no real `.env` is loaded. HTTP is served throug
 import base64
 import importlib.util
 import itertools
+import json
 import os
 import shutil
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import anyio
 import httpx
 import pytest
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.shared.memory import create_connected_server_and_client_session
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
@@ -348,3 +352,283 @@ def test_http_main_serves_app_with_uvicorn(
     )
     app = getattr(module, "app", None)
     assert launches == [("uvicorn.run", app, {"host": "localhost", "port": 9123})]
+
+
+# Endpoint identity and MCP_PUBLIC_URL
+
+
+def _add_probe_tools(module: ModuleType) -> None:
+    """Register test-only tools that report `_current_endpoint()` in different situations."""
+    entered: list[str] = []
+
+    def whoami() -> str:
+        """Return the current endpoint value."""
+        return module._current_endpoint().value
+
+    def whoami_then_zendesk() -> str:
+        """Resolve the endpoint, then make one Zendesk call."""
+        endpoint = module._current_endpoint()
+        module._get("/tickets/1.json")
+        return endpoint.value
+
+    def whoami_in_worker() -> str:
+        """Resolve at entry and carry it to a worker, and resolve again inside the worker."""
+        carried = module._current_endpoint()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                in_worker = executor.submit(module._current_endpoint).result().value
+            except RuntimeError as error:
+                in_worker = f"RuntimeError: {error}"
+            carried_in_worker = executor.submit(lambda: carried).result().value
+        return json.dumps({"in_worker": in_worker, "carried": carried_in_worker})
+
+    async def whoami_when_both_in() -> str:
+        """Wait until two calls are in flight, then return the current endpoint value."""
+        entered.append("call")
+        with anyio.fail_after(5):
+            while len(entered) < 2:
+                await anyio.sleep(0.01)
+        return module._current_endpoint().value
+
+    for tool in (whoami, whoami_then_zendesk, whoami_in_worker, whoami_when_both_in):
+        module.mcp.add_tool(tool)
+
+
+def _call(client: TestClient, path: str, name: str) -> tuple[bool, str]:
+    """Call a no-argument tool over HTTP and return (isError, first text content)."""
+    result = _rpc(client, path, "tools/call", {"name": name, "arguments": {}}).json()["result"]
+    return result["isError"], result["content"][0]["text"]
+
+
+async def _call_in_memory(module: ModuleType, name: str) -> tuple[bool, str]:
+    """Call a tool through an in-memory (non-HTTP) session and return (isError, text)."""
+    async with create_connected_server_and_client_session(module.mcp) as session:
+        result = await session.call_tool(name, {})
+    return result.isError, result.content[0].text
+
+
+def _transport_security(module: ModuleType) -> Callable[[str], Any]:
+    """Return the module's `_transport_security` builder, failing if it is missing."""
+    builder = getattr(module, "_transport_security", None)
+    assert callable(builder), "HTTP mode must define _transport_security"
+    return builder
+
+
+def test_current_endpoint_matches_path(load_server: Callable[..., ModuleType]) -> None:
+    """A real tools/call on each path reaches a tool body that sees that path's endpoint."""
+    module = _load_http(load_server)
+    _add_probe_tools(module)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        assert _call(client, ZENDESK_FLOW_PATH, "whoami") == (False, "zendesk_flow")
+        assert _call(client, CLAUDE_CODE_PATH, "whoami") == (False, "claude_code")
+
+
+def test_current_endpoint_in_tools_list(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_current_endpoint() also resolves inside a tools/list handler, per path."""
+    module = _load_http(load_server)
+    seen: list[str] = []
+    list_tools = module.mcp._tool_manager.list_tools
+
+    def spy_list_tools() -> list:
+        """Record the endpoint, then list the tools as usual."""
+        seen.append(module._current_endpoint().value)
+        return list_tools()
+
+    monkeypatch.setattr(module.mcp._tool_manager, "list_tools", spy_list_tools)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        for path in (ZENDESK_FLOW_PATH, CLAUDE_CODE_PATH):
+            assert _rpc(client, path, "tools/list").status_code == 200
+    assert seen == ["zendesk_flow", "claude_code"]
+
+
+def test_current_endpoint_concurrent_paths(load_server: Callable[..., ModuleType]) -> None:
+    """Two overlapping calls on different paths each see their own path's endpoint."""
+    module = _load_http(load_server)
+    _add_probe_tools(module)
+    with TestClient(module.app, base_url=BASE_URL) as client, ThreadPoolExecutor(2) as executor:
+        flow = executor.submit(_call, client, ZENDESK_FLOW_PATH, "whoami_when_both_in")
+        claude = executor.submit(_call, client, CLAUDE_CODE_PATH, "whoami_when_both_in")
+        assert flow.result() == (False, "zendesk_flow")
+        assert claude.result() == (False, "claude_code")
+
+
+@pytest.mark.parametrize("case", ["untagged_route", "string_tag", "stdio_tag", "outside_request"])
+def test_current_endpoint_refuses_unknown_route(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """In HTTP mode a call without a known Endpoint tag is refused before any Zendesk call."""
+    module = _load_http(load_server)
+    _add_probe_tools(module)
+    seen = _stub_zendesk(module, monkeypatch)
+    if case == "outside_request":
+        is_error, text = anyio.run(_call_in_memory, module, "whoami_then_zendesk")
+    else:
+        flow_route = next(
+            route for route in module.app.router.routes if route.path == ZENDESK_FLOW_PATH
+        )
+        transport_endpoint = flow_route.endpoint.app  # unwrap the _EndpointTag
+        tags = {"string_tag": "claude_code", "stdio_tag": module.Endpoint.STDIO}
+        endpoint = transport_endpoint
+        if case in tags:
+            endpoint = module._EndpointTag(transport_endpoint, tags[case])
+        module.app.router.routes.append(Route("/other/mcp", endpoint=endpoint))
+        with TestClient(module.app, base_url=BASE_URL) as client:
+            is_error, text = _call(client, "/other/mcp", "whoami_then_zendesk")
+    assert is_error is True
+    assert "Cannot tell which endpoint" in text
+    assert seen == []
+    if case == "outside_request":
+        with pytest.raises(RuntimeError, match="Cannot tell which endpoint"):
+            module._current_endpoint()
+
+
+def test_current_endpoint_http_worker_thread(load_server: Callable[..., ModuleType]) -> None:
+    """In HTTP mode a worker thread cannot resolve the endpoint; a value resolved at entry carries."""
+    module = _load_http(load_server)
+    _add_probe_tools(module)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        is_error, text = _call(client, ZENDESK_FLOW_PATH, "whoami_in_worker")
+    assert is_error is False, text
+    body = json.loads(text)
+    assert body["carried"] == "zendesk_flow"
+    assert body["in_worker"].startswith("RuntimeError: Cannot tell which endpoint")
+
+
+def test_current_endpoint_stdio(load_server: Callable[..., ModuleType]) -> None:
+    """Stdio mode returns STDIO in a session, in a worker thread, and outside a request."""
+    module = load_server()
+    _add_probe_tools(module)
+    assert anyio.run(_call_in_memory, module, "whoami") == (False, "stdio")
+    is_error, text = anyio.run(_call_in_memory, module, "whoami_in_worker")
+    assert is_error is False, text
+    assert json.loads(text) == {"in_worker": "stdio", "carried": "stdio"}
+    assert module._current_endpoint() is module.Endpoint.STDIO
+
+
+@pytest.mark.parametrize(
+    "url,hosts,origins",
+    [
+        (
+            "https://mcp.example.com",
+            ["mcp.example.com", "mcp.example.com:443"],
+            ["https://mcp.example.com", "https://mcp.example.com:443"],
+        ),
+        (
+            "https://MCP.Example.com:443/",
+            ["mcp.example.com", "mcp.example.com:443"],
+            ["https://mcp.example.com", "https://mcp.example.com:443"],
+        ),
+        (
+            "https://mcp.example.com:8443",
+            ["mcp.example.com:8443"],
+            ["https://mcp.example.com:8443"],
+        ),
+        ("http://[2001:db8::1]:8080", ["[2001:db8::1]:8080"], ["http://[2001:db8::1]:8080"]),
+        (
+            "http://mcp.example.com",
+            ["mcp.example.com", "mcp.example.com:80"],
+            ["http://mcp.example.com", "http://mcp.example.com:80"],
+        ),
+    ],
+)
+def test_transport_security_public_entries(
+    load_server: Callable[..., ModuleType], url: str, hosts: list[str], origins: list[str]
+) -> None:
+    """The public URL adds its hosts and origins after the loopback entries, protection on."""
+    security = _transport_security(_load_http(load_server))(url)
+    assert security.enable_dns_rebinding_protection is True
+    assert security.allowed_hosts == ["127.0.0.1:*", "localhost:*", "[::1]:*", *hosts]
+    assert security.allowed_origins[3:] == origins
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "mcp.example.com",
+        "ftp://mcp.example.com",
+        "https://",
+        "https://user:pw@mcp.example.com",
+        "https://user@mcp.example.com",
+        "https://:pw@mcp.example.com",
+        "https://mcp.example.com/zendesk/mcp",
+        "https://mcp.example.com?x=1",
+        "https://mcp.example.com#frag",
+        "https://mcp.example.com:abc",
+        "https://mcp.example.com:0",
+        "https://mcp.example.com ",
+        "https://[::1",
+    ],
+)
+def test_http_mode_rejects_bad_public_url(load_server: Callable[..., ModuleType], url: str) -> None:
+    """A malformed MCP_PUBLIC_URL raises ValueError at import, naming it invalid."""
+    with pytest.raises(ValueError, match="Invalid MCP_PUBLIC_URL"):
+        load_server(MCP_TRANSPORT="streamable-http", MCP_PUBLIC_URL=url)
+
+
+@pytest.mark.parametrize(
+    "creds", [{}, {"ZENDESK_EMAIL": None, "ZENDESK_API_KEY": None}], ids=["env_creds", "no_creds"]
+)
+def test_http_mode_refuses_public_url(
+    load_server: Callable[..., ModuleType], creds: dict[str, str | None]
+) -> None:
+    """A valid MCP_PUBLIC_URL is refused at import until caller authentication exists."""
+    with pytest.raises(RuntimeError, match="Refusing MCP_PUBLIC_URL"):
+        load_server(
+            MCP_TRANSPORT="streamable-http", MCP_PUBLIC_URL="https://mcp.example.com", **creds
+        )
+
+
+def test_public_url_empty_means_unset(load_server: Callable[..., ModuleType]) -> None:
+    """An empty MCP_PUBLIC_URL is treated as unset: the server loads with loopback entries only."""
+    module = _load_http(load_server, MCP_PUBLIC_URL="")
+    loopback_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    assert module.mcp.settings.transport_security.allowed_hosts == loopback_hosts
+
+
+def test_stdio_ignores_public_url(load_server: Callable[..., ModuleType]) -> None:
+    """Stdio does not read MCP_PUBLIC_URL, so any value imports."""
+    for value in ("not a url", "https://mcp.example.com"):
+        assert load_server(MCP_PUBLIC_URL=value).TRANSPORT == "stdio"
+
+
+def test_public_url_keeps_loopback_guard(load_server: Callable[..., ModuleType]) -> None:
+    """The loopback-only MCP_HOST check runs before MCP_PUBLIC_URL is read."""
+    with pytest.raises(RuntimeError, match="MCP_HOST"):
+        load_server(
+            MCP_TRANSPORT="streamable-http",
+            MCP_HOST="0.0.0.0",
+            MCP_PUBLIC_URL="https://mcp.example.com",
+        )
+
+
+def test_public_url_keeps_port_check(load_server: Callable[..., ModuleType]) -> None:
+    """The MCP_PORT check runs before MCP_PUBLIC_URL is validated."""
+    with pytest.raises(ValueError, match="Invalid MCP_PORT"):
+        load_server(MCP_TRANSPORT="streamable-http", MCP_PORT="0", MCP_PUBLIC_URL="not a url")
+
+
+def test_public_host_check(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the public settings applied, the public Host/Origin pass and others get 421/403."""
+    module = _load_http(load_server)
+    security = _transport_security(module)("https://mcp.example.com")
+    # The settings that would apply once the refusal is lifted; the manager reads them per request.
+    monkeypatch.setattr(module.mcp.session_manager, "security_settings", security)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+
+        def status(path: str = CLAUDE_CODE_PATH, **headers: str) -> int:
+            """Return the HTTP status of a tools/list request with the given headers."""
+            return _rpc(client, path, "tools/list", **headers).status_code
+
+        assert status(host="mcp.example.com") == 200
+        assert status(ZENDESK_FLOW_PATH, host="mcp.example.com") == 200
+        assert status(host="mcp.example.com:443") == 200
+        assert status(host="mcp.example.com:8443") == 421
+        assert status(host="evil.com") == 421
+        assert status(host="127.0.0.1:8000") == 200
+        assert status(host="mcp.example.com", origin="https://mcp.example.com") == 200
+        assert status(host="mcp.example.com", origin="https://evil.com") == 403
+        assert status(host="mcp.example.com", origin="http://mcp.example.com") == 403

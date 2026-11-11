@@ -11,10 +11,12 @@ MCP_HOST (default 127.0.0.1; loopback only until caller authentication exists) a
 (default 8000). It serves the same tools at /zendesk/mcp (Zendesk action flows) and /claude/mcp
 (Claude Code), plus /health. It omits export_ticket_comments and attach_file_to_ticket, which use
 the server's local filesystem (so file attachments are stdio-only), and the levels have
-17 / 22 / 31 tools.
+17 / 22 / 31 tools. MCP_PUBLIC_URL (optional) names the public base URL; it is validated, and
+HTTP mode refuses to start while it is set, until caller authentication exists.
 """
 
 import base64
+import enum
 import json
 import math
 import mimetypes
@@ -25,12 +27,15 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP, Image
+
+if TYPE_CHECKING:
+    from mcp.server.transport_security import TransportSecuritySettings
 
 # Load .env from the same directory as this script
 load_dotenv(Path(__file__).parent / ".env")
@@ -61,6 +66,90 @@ _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 ToolFunction = TypeVar("ToolFunction", bound=Callable[..., Any])
 
 
+class Endpoint(enum.Enum):
+    """Where the current tool call came from.
+
+    STDIO is a local stdio session. ZENDESK_FLOW is `/zendesk/mcp` (Zendesk action flows) and
+    CLAUDE_CODE is `/claude/mcp` (Claude Code), both in HTTP mode.
+    """
+
+    STDIO = "stdio"
+    ZENDESK_FLOW = "zendesk_flow"
+    CLAUDE_CODE = "claude_code"
+
+
+# ASGI scope key under which each HTTP route records its Endpoint.
+_ENDPOINT_SCOPE_KEY = "zendesk_mcp.endpoint"
+_HTTP_ENDPOINTS = (Endpoint.ZENDESK_FLOW, Endpoint.CLAUDE_CODE)
+
+
+def _public_url_entries(public_url: str) -> tuple[list[str], list[str]]:
+    """Turn MCP_PUBLIC_URL into Host and Origin entries for TransportSecuritySettings.
+
+    The SDK matches a Host or Origin exactly, or by a `base:*` pattern that needs an explicit
+    port, so the bare host and the host with the scheme's default port are listed separately.
+
+    Args:
+        public_url: The MCP_PUBLIC_URL value, e.g. `https://mcp.example.com`.
+
+    Returns:
+        The allowed Host values and the allowed Origin values.
+
+    Raises:
+        ValueError: The scheme is not http or https; the host is empty; the value has a user
+            name or password, a path other than `/`, a query, a fragment or surrounding
+            whitespace; or the port is not a number in 1-65535. Other characters are not checked.
+    """
+    error = ValueError(
+        f"Invalid MCP_PUBLIC_URL: {public_url!r}. Must be http(s)://host[:port] with no path."
+    )
+    try:
+        parsed = urlparse(public_url)
+        port = parsed.port
+    except ValueError:  # malformed IPv6 brackets or a non-numeric / out-of-range port
+        raise error from None
+    if public_url != public_url.strip() or port == 0:
+        raise error
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise error
+    if parsed.username or parsed.password or parsed.path not in ("", "/"):
+        raise error
+    if parsed.query or parsed.fragment:
+        raise error
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    default_port = 443 if parsed.scheme == "https" else 80
+    if port is not None and port != default_port:
+        return [f"{host}:{port}"], [f"{parsed.scheme}://{host}:{port}"]
+    hosts = [host, f"{host}:{default_port}"]
+    origins = [f"{parsed.scheme}://{host}", f"{parsed.scheme}://{host}:{default_port}"]
+    return hosts, origins
+
+
+def _transport_security(public_url: str) -> "TransportSecuritySettings":
+    """Build the DNS-rebinding settings: loopback hosts plus the MCP_PUBLIC_URL host, if any.
+
+    Args:
+        public_url: The MCP_PUBLIC_URL value; empty for none.
+
+    Returns:
+        Settings with DNS-rebinding protection on.
+
+    Raises:
+        ValueError: `public_url` is set but malformed.
+    """
+    # Imported here so stdio keeps importing on an older mcp that lacks this module.
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    # Passing any settings turns off FastMCP's localhost defaults, so list loopback explicitly.
+    allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    allowed_origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+    if public_url:
+        public_hosts, public_origins = _public_url_entries(public_url)
+        allowed_hosts += public_hosts
+        allowed_origins += public_origins
+    return TransportSecuritySettings(allowed_hosts=allowed_hosts, allowed_origins=allowed_origins)
+
+
 def _http_settings() -> dict[str, Any]:
     """Read and validate the HTTP-mode settings passed to FastMCP.
 
@@ -68,12 +157,11 @@ def _http_settings() -> dict[str, Any]:
         FastMCP keyword arguments: `host`, `port` and a loopback-only `transport_security`.
 
     Raises:
-        ValueError: MCP_PORT is not a port number.
-        RuntimeError: MCP_HOST is not a loopback address; HTTP mode has no caller auth yet.
+        ValueError: MCP_PORT is not a port number, or MCP_PUBLIC_URL fails the checks in
+            `_public_url_entries`.
+        RuntimeError: MCP_HOST is not a loopback address, or MCP_PUBLIC_URL is set; HTTP mode
+            has no caller authentication yet.
     """
-    # Imported here so stdio keeps importing on an older mcp that lacks this module.
-    from mcp.server.transport_security import TransportSecuritySettings
-
     host = os.environ.get("MCP_HOST", "127.0.0.1")
     port_raw = os.environ.get("MCP_PORT", "8000")
     try:
@@ -87,11 +175,13 @@ def _http_settings() -> dict[str, Any]:
             f"Refusing MCP_HOST={host!r}: HTTP mode has no caller authentication yet; "
             "set MCP_HOST to 127.0.0.1, localhost or ::1."
         )
-    # Passing any settings turns off FastMCP's localhost defaults, so list loopback explicitly.
-    security = TransportSecuritySettings(
-        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"],
-        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
-    )
+    public_url = os.environ.get("MCP_PUBLIC_URL", "")
+    security = _transport_security(public_url)
+    if public_url:
+        raise RuntimeError(
+            f"Refusing MCP_PUBLIC_URL={public_url!r}: HTTP mode has no caller authentication yet, "
+            "so a public URL would expose Zendesk to anyone who reaches it. Unset it."
+        )
     return {"host": host, "port": port, "transport_security": security}
 
 
@@ -105,6 +195,34 @@ else:
         streamable_http_path=CLAUDE_CODE_PATH,
         **_http_settings(),
     )
+
+
+def _current_endpoint() -> Endpoint:
+    """Return the endpoint the current tool call came from.
+
+    Call it in the tool's own thread, at tool entry, and pass the value down: the MCP request
+    context is a contextvar, which does not reach ThreadPoolExecutor workers. It also works
+    inside other MCP request handlers, such as tools/list.
+
+    Returns:
+        Endpoint.STDIO in stdio mode (any thread, inside or outside a request); otherwise the
+        Endpoint recorded by the HTTP route that received the request.
+
+    Raises:
+        RuntimeError: HTTP mode, and the call has no HTTP request or its route did not record a
+            known endpoint (including when called from a ThreadPoolExecutor worker). Never
+            guesses.
+    """
+    if TRANSPORT == "stdio":
+        return Endpoint.STDIO
+    try:
+        request = mcp.get_context().request_context.request
+    except ValueError:  # no MCP request in this thread
+        request = None
+    endpoint = None if request is None else request.scope.get(_ENDPOINT_SCOPE_KEY)
+    if endpoint not in _HTTP_ENDPOINTS:
+        raise RuntimeError("Cannot tell which endpoint this tool call came from; refusing it.")
+    return endpoint
 
 
 def _stdio_only_tool() -> Callable[[ToolFunction], ToolFunction]:
@@ -1895,6 +2013,20 @@ if TRANSPORT == "streamable-http":
     from starlette.requests import Request
     from starlette.responses import JSONResponse
     from starlette.routing import Route
+    from starlette.types import ASGIApp, Receive, Scope, Send
+
+    class _EndpointTag:
+        """ASGI wrapper that records which endpoint a request arrived on, for _current_endpoint.
+
+        A class, not a function: Starlette treats a plain function endpoint as a request handler.
+        """
+
+        def __init__(self, app: ASGIApp, endpoint: Endpoint) -> None:
+            self.app = app
+            self.endpoint = endpoint
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            await self.app({**scope, _ENDPOINT_SCOPE_KEY: self.endpoint}, receive, send)
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> JSONResponse:
@@ -1930,8 +2062,12 @@ if TRANSPORT == "streamable-http":
         index = matches[0]
         transport_endpoint = http_app.router.routes[index].endpoint
         http_app.router.routes[index : index + 1] = [
-            Route(ZENDESK_FLOW_PATH, endpoint=transport_endpoint),
-            Route(CLAUDE_CODE_PATH, endpoint=transport_endpoint),
+            Route(
+                ZENDESK_FLOW_PATH, endpoint=_EndpointTag(transport_endpoint, Endpoint.ZENDESK_FLOW)
+            ),
+            Route(
+                CLAUDE_CODE_PATH, endpoint=_EndpointTag(transport_endpoint, Endpoint.CLAUDE_CODE)
+            ),
         ]
         return http_app
 
