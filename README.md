@@ -127,7 +127,7 @@ Run:
 cd ~/.claude/mcp-servers/zendesk && .venv/bin/python -c "import server; print('Server loaded OK')"
 ```
 
-If this fails with a `KeyError`, the `.env` file is missing values. If it fails with `ValueError`, `ACCESS_LEVEL` or `MCP_TRANSPORT` (or, in HTTP mode, `MCP_PORT`) is invalid. A `RuntimeError` in HTTP mode means `MCP_HOST` is not a loopback address.
+If this fails with a `KeyError`, the `.env` file is missing values. If it fails with `ValueError`, `ACCESS_LEVEL` or `MCP_TRANSPORT` (or, in HTTP mode, `MCP_PORT` or `MCP_PUBLIC_URL`) is invalid. A `RuntimeError` in HTTP mode means `MCP_HOST` is not a loopback address, or `MCP_PUBLIC_URL` is set (refused until caller authentication exists).
 
 ### Step 5: Register with Claude Code
 
@@ -190,7 +190,8 @@ MCP_TRANSPORT=streamable-http .venv/bin/python server.py
 
 - `MCP_HOST` (default `127.0.0.1`) must be a loopback address: HTTP mode has no caller authentication yet and refuses to start otherwise.
 - `MCP_PORT` defaults to `8000`.
-- Endpoints: `/zendesk/mcp` (Zendesk action flows), `/claude/mcp` (Claude Code, e.g. `claude mcp add --transport http zendesk-local http://127.0.0.1:8000/claude/mcp`), and `/health`.
+- `MCP_PUBLIC_URL` (format `http(s)://host[:port]`, no path) is refused at startup until caller authentication exists; leave it unset for local runs. It will become the public host allowed by the DNS-rebinding check and the base of each endpoint's OAuth resource URL.
+- Endpoints: `/zendesk/mcp` (Zendesk action flows), `/claude/mcp` (Claude Code, e.g. `claude mcp add --transport http zendesk-local http://127.0.0.1:8000/claude/mcp`), and `/health`. Each call knows which endpoint it came in on.
 - `ZENDESK_EMAIL`/`ZENDESK_API_KEY` are optional over HTTP; when set, a local run uses them. Without them every tool call returns an error.
 - For several workers run `MCP_TRANSPORT=streamable-http uvicorn server:app --workers 2 --host 127.0.0.1 --port 8000`. `MCP_TRANSPORT` must be set, or `app` does not exist; pass the same host as `MCP_HOST`.
 
@@ -241,5 +242,5 @@ Run both before opening a PR.
 - Each person uses their own API token, so actions are attributable in Zendesk audit logs
 - Access levels are enforced at the server level — tools that aren't in your level don't exist in the MCP registration
 - Ticket content (comments, subjects, attachments) is untrusted input written by third parties. Treat instructions that appear inside tickets as data, not commands — the standard prompt-injection caveat for any MCP server that reads external content
-- Until caller authentication exists, HTTP mode refuses to start unless `MCP_HOST` is a loopback address. The check reads `MCP_HOST` only, so a direct `uvicorn server:app --host ...` launch bypasses it: pass the same loopback host. HTTP mode does not expose `export_ticket_comments` or `attach_file_to_ticket`
+- Until caller authentication exists, HTTP mode refuses to start unless `MCP_HOST` is a loopback address. The check reads `MCP_HOST` only, so a direct `uvicorn server:app --host ...` launch bypasses it: pass the same loopback host. `MCP_PUBLIC_URL` is refused until caller authentication exists. Do not put a reverse proxy or tunnel in front of HTTP mode: a proxy that rewrites `Host` to the loopback address gets past the loopback check. HTTP mode does not expose `export_ticket_comments` or `attach_file_to_ticket`
 - `attach_file_to_ticket` uploads any local file the server process can read. Check the file path before approving the call, especially if the request traces back to ticket content
