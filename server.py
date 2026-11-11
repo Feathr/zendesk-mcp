@@ -5,6 +5,13 @@ Access levels controlled by ACCESS_LEVEL env var:
         attachments, articles (18 tools)
     management — readonly + create/update tickets, comments, tags, file attachments (24 tools)
     admin      — management + user/org CRUD, merge, bulk ops, delete (33 tools)
+
+Transport is set by MCP_TRANSPORT: `stdio` (default) or `streamable-http`. HTTP mode reads
+MCP_HOST (default 127.0.0.1; loopback only until caller authentication exists) and MCP_PORT
+(default 8000). It serves the same tools at /zendesk/mcp (Zendesk action flows) and /claude/mcp
+(Claude Code), plus /health. It omits export_ticket_comments and attach_file_to_ticket, which use
+the server's local filesystem (so file attachments are stdio-only), and the levels have
+17 / 22 / 31 tools.
 """
 
 import base64
@@ -12,10 +19,13 @@ import json
 import math
 import mimetypes
 import os
+import re
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 import httpx
@@ -26,8 +36,15 @@ from mcp.server.fastmcp import FastMCP, Image
 load_dotenv(Path(__file__).parent / ".env")
 
 SUBDOMAIN = os.environ["ZENDESK_SUBDOMAIN"]
-EMAIL = os.environ["ZENDESK_EMAIL"]
-API_KEY = os.environ["ZENDESK_API_KEY"]
+TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio").lower()
+if TRANSPORT not in ("stdio", "streamable-http"):
+    raise ValueError(f"Invalid MCP_TRANSPORT: {TRANSPORT!r}. Must be stdio or streamable-http.")
+if TRANSPORT == "stdio":
+    EMAIL = os.environ["ZENDESK_EMAIL"]
+    API_KEY = os.environ["ZENDESK_API_KEY"]
+else:
+    EMAIL: str | None = os.environ.get("ZENDESK_EMAIL")
+    API_KEY: str | None = os.environ.get("ZENDESK_API_KEY")
 ACCESS_LEVEL = os.environ.get("ACCESS_LEVEL", "readonly").lower()
 
 if ACCESS_LEVEL not in ("readonly", "management", "admin"):
@@ -37,7 +54,114 @@ if ACCESS_LEVEL not in ("readonly", "management", "admin"):
 
 BASE_URL = f"https://{SUBDOMAIN}.zendesk.com/api/v2"
 
-mcp = FastMCP("zendesk")
+ZENDESK_FLOW_PATH = "/zendesk/mcp"
+CLAUDE_CODE_PATH = "/claude/mcp"
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+ToolFunction = TypeVar("ToolFunction", bound=Callable[..., Any])
+
+
+def _http_settings() -> dict[str, Any]:
+    """Read and validate the HTTP-mode settings passed to FastMCP.
+
+    Returns:
+        FastMCP keyword arguments: `host`, `port` and a loopback-only `transport_security`.
+
+    Raises:
+        ValueError: MCP_PORT is not a port number.
+        RuntimeError: MCP_HOST is not a loopback address; HTTP mode has no caller auth yet.
+    """
+    # Imported here so stdio keeps importing on an older mcp that lacks this module.
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    host = os.environ.get("MCP_HOST", "127.0.0.1")
+    port_raw = os.environ.get("MCP_PORT", "8000")
+    try:
+        port = int(port_raw)
+    except ValueError:
+        raise ValueError(f"Invalid MCP_PORT: {port_raw!r}. Must be a port number.") from None
+    if not 1 <= port <= 65535:
+        raise ValueError(f"Invalid MCP_PORT: {port_raw!r}. Must be a port number.")
+    if host not in _LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"Refusing MCP_HOST={host!r}: HTTP mode has no caller authentication yet; "
+            "set MCP_HOST to 127.0.0.1, localhost or ::1."
+        )
+    # Passing any settings turns off FastMCP's localhost defaults, so list loopback explicitly.
+    security = TransportSecuritySettings(
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"],
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
+    )
+    return {"host": host, "port": port, "transport_security": security}
+
+
+if TRANSPORT == "stdio":
+    mcp = FastMCP("zendesk")
+else:
+    mcp = FastMCP(
+        "zendesk",
+        stateless_http=True,
+        json_response=True,
+        streamable_http_path=CLAUDE_CODE_PATH,
+        **_http_settings(),
+    )
+
+
+def _stdio_only_tool() -> Callable[[ToolFunction], ToolFunction]:
+    """Register a tool in stdio mode only.
+
+    The tools it wraps read or write the server's local filesystem, which an HTTP caller does
+    not share.
+
+    Returns:
+        `mcp.tool()` in stdio mode; otherwise a decorator that leaves the function unregistered.
+    """
+    if TRANSPORT == "stdio":
+        return mcp.tool()
+
+    def leave_unregistered(fn: ToolFunction) -> ToolFunction:
+        return fn
+
+    return leave_unregistered
+
+
+def _http_doc_remove(phrase: str, replacement: str) -> Callable[[ToolFunction], ToolFunction]:
+    """Remove a phrase from a tool docstring in HTTP mode, before the tool is registered.
+
+    Whitespace in `phrase` matches any whitespace run, so the match does not depend on the
+    docstring indentation that Python 3.13+ strips at compile time.
+
+    Args:
+        phrase: Words to remove, written on one line.
+        replacement: Text that replaces the phrase and the whitespace before it.
+
+    Returns:
+        A decorator that rewrites `fn.__doc__` in HTTP mode and is a no-op in stdio mode.
+
+    Raises:
+        RuntimeError: In HTTP mode, the phrase does not occur exactly once.
+    """
+
+    def decorate(fn: ToolFunction) -> ToolFunction:
+        if TRANSPORT == "stdio":
+            return fn
+        pattern = r"\s*" + r"\s+".join(re.escape(word) for word in phrase.split())
+        doc = fn.__doc__ or ""
+        if len(re.findall(pattern, doc)) != 1:
+            raise RuntimeError(f"{fn.__name__}: expected exactly one {phrase!r} in the docstring")
+        fn.__doc__ = re.sub(pattern, replacement, doc, count=1)
+        return fn
+
+    return decorate
+
+
+if TRANSPORT == "stdio":
+    _COMMENTS_TOO_LARGE_HINT = "Use export_ticket_comments to write the thread to a local file."
+else:
+    _COMMENTS_TOO_LARGE_HINT = (
+        "This thread is too large to return inline, and exporting to a file is not available "
+        "on this server."
+    )
 
 _client = httpx.Client(
     base_url=BASE_URL,
@@ -60,8 +184,16 @@ def _zendesk_auth() -> ZendeskAuth:
     Returns:
         The basic-auth tuple ``("<email>/token", api_key)``. A later change will return the
         caller's bearer token when the server runs over HTTP; call sites must not change.
+
+    Raises:
+        RuntimeError: HTTP mode without both ZENDESK_EMAIL and ZENDESK_API_KEY. No request is sent.
     """
-    return (f"{EMAIL}/token", API_KEY)
+    if TRANSPORT == "stdio" or (EMAIL and API_KEY):
+        return (f"{EMAIL}/token", API_KEY)
+    raise RuntimeError(
+        "No Zendesk credentials for this request: set ZENDESK_EMAIL and ZENDESK_API_KEY "
+        "for a local HTTP run."
+    )
 
 
 def _get(path: str, params: dict | None = None) -> dict:
@@ -496,6 +628,7 @@ def get_ticket(ticket_id: int) -> str:
 
 
 @mcp.tool()
+@_http_doc_remove("; use `export_ticket_comments` to write those to a local file.", ".")
 def get_ticket_comments(ticket_id: int) -> str:
     """Get all comments (replies) on a Zendesk ticket, in chronological order.
 
@@ -522,7 +655,7 @@ def get_ticket_comments(ticket_id: int) -> str:
     return json.dumps(comments, indent=2)
 
 
-@mcp.tool()
+@_stdio_only_tool()
 def export_ticket_comments(ticket_id: int, output_path: str) -> str:
     """Write all comments on a ticket to a local JSON file instead of returning them.
 
@@ -712,7 +845,7 @@ class _CommentThreadTooLarge(Exception):
             "ticket_id": self.ticket_id,
             "comments_fetched_before_stop": self.fetched,
             "total_comments": self.total,
-            "hint": "Use export_ticket_comments to write the thread to a local file.",
+            "hint": _COMMENTS_TOO_LARGE_HINT,
         }
 
 
@@ -750,6 +883,7 @@ def _fetch_comments(
 
 
 @mcp.tool()
+@_http_doc_remove("(fetch it with `export_ticket_comments`)", "")
 def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) -> str:
     """Bulk-fetch comments for many tickets in parallel.
 
@@ -1423,7 +1557,7 @@ if ACCESS_LEVEL in ("management", "admin"):
         data = _put(f"/tickets/{ticket_id}.json", {"ticket": {"tags": updated}})
         return json.dumps({"id": ticket_id, "tags": data["ticket"].get("tags", [])}, indent=2)
 
-    @mcp.tool()
+    @_stdio_only_tool()
     def attach_file_to_ticket(
         ticket_id: int,
         file_paths: list[str],
@@ -1756,5 +1890,59 @@ if ACCESS_LEVEL == "admin":
         )
 
 
+if TRANSPORT == "streamable-http":
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(request: Request) -> JSONResponse:
+        """Liveness check for load balancers; makes no Zendesk call.
+
+        Args:
+            request: The incoming request (unused).
+
+        Returns:
+            JSON `{"status": "ok"}` with status 200.
+        """
+        return JSONResponse({"status": "ok"})
+
+    def _build_http_app() -> Starlette:
+        """Build the ASGI app with the MCP endpoint served at both endpoint paths.
+
+        Returns:
+            The FastMCP Starlette app, with its single MCP route replaced by two routes that
+            share the same transport endpoint and session manager.
+
+        Raises:
+            RuntimeError: The SDK app does not have exactly one MCP route to replace.
+        """
+        http_app = mcp.streamable_http_app()
+        mcp_path = mcp.settings.streamable_http_path
+        matches = [
+            index
+            for index, route in enumerate(http_app.router.routes)
+            if isinstance(route, Route) and route.path == mcp_path
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(f"mcp SDK app layout changed: expected one MCP route at {mcp_path}")
+        index = matches[0]
+        transport_endpoint = http_app.router.routes[index].endpoint
+        http_app.router.routes[index : index + 1] = [
+            Route(ZENDESK_FLOW_PATH, endpoint=transport_endpoint),
+            Route(CLAUDE_CODE_PATH, endpoint=transport_endpoint),
+        ]
+        return http_app
+
+    app = _build_http_app()
+
+
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    if TRANSPORT == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        import uvicorn
+
+        # Pass the app object: an import string would import this module a second time.
+        uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
