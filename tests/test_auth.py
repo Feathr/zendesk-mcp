@@ -7,12 +7,18 @@ fake `httpx.stream`. No real Zendesk instance or `.env` is needed.
 import base64
 import contextlib
 import contextvars
+import importlib.util
 import json
+import shutil
 import threading
 from collections.abc import Callable, Iterator
+from pathlib import Path
+from types import ModuleType
 
+import anyio
 import httpx
 import pytest
+from mcp.shared.memory import create_connected_server_and_client_session
 
 import server
 
@@ -278,3 +284,36 @@ def test_post_upload_sends_upload_timeout(sent_requests: list[httpx.Request]) ->
 
     assert len(sent_requests) == 1
     assert sent_requests[0].extensions["timeout"] == httpx.Timeout(120.0).as_dict()
+
+
+async def _call_tool_in_memory(module: ModuleType, name: str, arguments: dict) -> tuple[bool, str]:
+    """Call a tool through an in-memory MCP session and return (isError, first text content)."""
+    async with create_connected_server_and_client_session(module.mcp) as session:
+        result = await session.call_tool(name, arguments)
+    return result.isError, result.content[0].text
+
+
+def test_require_write_scope_noop_in_stdio(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """In stdio a write tool runs with the env basic auth; it needs no OAuth `write` scope."""
+    shutil.copy(Path(server.__file__), tmp_path / "server.py")  # no real .env next to the copy
+    monkeypatch.setenv("ACCESS_LEVEL", "management")
+    spec = importlib.util.spec_from_file_location("server_management", tmp_path / "server.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    recorded: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record the request and answer with a tagged ticket."""
+        recorded.append(request)
+        return httpx.Response(200, json={"ticket": {"id": 1, "tags": ["x"]}})
+
+    stub_client = httpx.Client(base_url=module.BASE_URL, transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(module, "_client", stub_client)
+
+    arguments = {"ticket_id": 1, "tags": ["x"]}
+    is_error, text = anyio.run(_call_tool_in_memory, module, "add_ticket_tags", arguments)
+
+    assert is_error is False, text
+    assert [request.method for request in recorded] == ["GET", "PUT"]
+    expected_header = _basic_header(("env@example.com/token", "env-key"))
+    assert {request.headers.get("authorization") for request in recorded} == {expected_header}

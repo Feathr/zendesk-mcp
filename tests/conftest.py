@@ -14,3 +14,5 @@ os.environ["ZENDESK_API_KEY"] = "env-key"
 os.environ["ZENDESK_HELP_CENTER_HOST"] = "help.example.com"
 os.environ["ACCESS_LEVEL"] = "readonly"
 os.environ["MCP_TRANSPORT"] = "stdio"
+# HTTP mode requires it; matches client_id 7 in the stubbed tokens/current answers.
+os.environ["ZENDESK_OAUTH_CLIENT_ID"] = "7"
