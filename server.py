@@ -7,12 +7,17 @@ Access levels controlled by ACCESS_LEVEL env var:
     admin      — management + user/org CRUD, merge, bulk ops, delete (33 tools)
 
 Transport is set by MCP_TRANSPORT: `stdio` (default) or `streamable-http`. HTTP mode reads
-MCP_HOST (default 127.0.0.1; loopback only until caller authentication exists) and MCP_PORT
-(default 8000). It serves the same tools at /zendesk/mcp (Zendesk action flows) and /claude/mcp
-(Claude Code), plus /health. It omits export_ticket_comments and attach_file_to_ticket, which use
-the server's local filesystem (so file attachments are stdio-only), and the levels have
-17 / 22 / 31 tools. MCP_PUBLIC_URL (optional) names the public base URL; it is validated, and
-HTTP mode refuses to start while it is set, until caller authentication exists.
+MCP_HOST (default 127.0.0.1) and MCP_PORT (default 8000). It serves the same tools at
+/zendesk/mcp (Zendesk action flows) and /claude/mcp (Claude Code), plus /health. It omits
+export_ticket_comments and attach_file_to_ticket, which use the server's local filesystem (so file
+attachments are stdio-only), and the levels have 17 / 22 / 31 tools.
+
+HTTP mode is an OAuth resource server with Zendesk as the authorization server. Every MCP request
+needs a Zendesk OAuth token issued to the client ZENDESK_OAUTH_CLIENT_ID (required in HTTP mode)
+with the `read` scope; the server forwards that token to Zendesk and never uses ZENDESK_EMAIL or
+ZENDESK_API_KEY. Write tools also need the `write` scope; ACCESS_LEVEL stays the ceiling.
+MCP_PUBLIC_URL (`https://host[:port]`) is the public base URL; it is required when MCP_HOST is
+not a loopback address.
 """
 
 import base64
@@ -23,18 +28,20 @@ import mimetypes
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import unquote_plus, urlparse, urlsplit
 
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP, Image
 
 if TYPE_CHECKING:
+    from mcp.server.auth.provider import AccessToken
     from mcp.server.transport_security import TransportSecuritySettings
 
 # Load .env from the same directory as this script
@@ -47,9 +54,17 @@ if TRANSPORT not in ("stdio", "streamable-http"):
 if TRANSPORT == "stdio":
     EMAIL = os.environ["ZENDESK_EMAIL"]
     API_KEY = os.environ["ZENDESK_API_KEY"]
+    OAUTH_CLIENT_ID: str | None = None
 else:
-    EMAIL: str | None = os.environ.get("ZENDESK_EMAIL")
-    API_KEY: str | None = os.environ.get("ZENDESK_API_KEY")
+    # HTTP mode sends each caller's own OAuth token; it never reads the API-token credentials.
+    EMAIL: str | None = None
+    API_KEY: str | None = None
+    OAUTH_CLIENT_ID = os.environ["ZENDESK_OAUTH_CLIENT_ID"]
+    if re.fullmatch(r"[1-9][0-9]*", OAUTH_CLIENT_ID) is None:
+        raise ValueError(
+            f"Invalid ZENDESK_OAUTH_CLIENT_ID: {OAUTH_CLIENT_ID!r}. Must be the OAuth client's "
+            "numeric ID."
+        )
 ACCESS_LEVEL = os.environ.get("ACCESS_LEVEL", "readonly").lower()
 
 if ACCESS_LEVEL not in ("readonly", "management", "admin"):
@@ -83,11 +98,57 @@ _ENDPOINT_SCOPE_KEY = "zendesk_mcp.endpoint"
 _HTTP_ENDPOINTS = (Endpoint.ZENDESK_FLOW, Endpoint.CLAUDE_CODE)
 
 
+def _public_url_parts(public_url: str) -> tuple[str, int | None]:
+    """Validate MCP_PUBLIC_URL and return its host (IPv6 in brackets, lowercased) and port.
+
+    Args:
+        public_url: The MCP_PUBLIC_URL value, e.g. `https://mcp.example.com`.
+
+    Returns:
+        The host as it appears in a Host header, and the explicit port or None.
+
+    Raises:
+        ValueError: The scheme is not `https`; the value has whitespace or a control character
+            anywhere, an `@`, a non-empty path (a trailing `/` included), query or fragment; the
+            host, after lowercasing, has characters other than letters, digits, `.` and `-`
+            (inside brackets: hex digits, `:` and `.`), or a trailing dot; or the port is not in
+            1-65535. Empty query, fragment or port markers (`?`, `#`, `:`) and leading zeros in
+            the port pass and are dropped from the result.
+    """
+    error = ValueError(
+        f"Invalid MCP_PUBLIC_URL: {public_url!r}. Must be https://host[:port] with no path "
+        "and no trailing slash."
+    )
+    # urlsplit silently drops tabs and newlines, so check every character first.
+    if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in public_url):
+        raise error
+    try:
+        parts = urlsplit(public_url)
+        port = parts.port
+    except ValueError:  # malformed IPv6 brackets or a non-numeric / out-of-range port
+        raise error from None
+    if parts.scheme != "https" or port == 0 or "@" in parts.netloc:
+        raise error
+    if parts.path or parts.query or parts.fragment:
+        raise error
+    hostname = parts.hostname or ""
+    if parts.netloc.startswith("["):
+        host_is_valid = re.fullmatch(r"[0-9a-f:.]+", hostname) is not None
+        host = f"[{hostname}]"
+    else:
+        host_is_valid = re.fullmatch(r"[a-z0-9.-]+", hostname) is not None
+        host_is_valid = host_is_valid and not hostname.endswith(".")
+        host = hostname
+    if not host_is_valid:
+        raise error
+    return host, port
+
+
 def _public_url_entries(public_url: str) -> tuple[list[str], list[str]]:
     """Turn MCP_PUBLIC_URL into Host and Origin entries for TransportSecuritySettings.
 
     The SDK matches a Host or Origin exactly, or by a `base:*` pattern that needs an explicit
-    port, so the bare host and the host with the scheme's default port are listed separately.
+    port, so the bare host and the host with port 443 are listed separately.
 
     Args:
         public_url: The MCP_PUBLIC_URL value, e.g. `https://mcp.example.com`.
@@ -96,33 +157,42 @@ def _public_url_entries(public_url: str) -> tuple[list[str], list[str]]:
         The allowed Host values and the allowed Origin values.
 
     Raises:
-        ValueError: The scheme is not http or https; the host is empty; the value has a user
-            name or password, a path other than `/`, a query, a fragment or surrounding
-            whitespace; or the port is not a number in 1-65535. Other characters are not checked.
+        ValueError: The value fails the checks in `_public_url_parts`.
     """
-    error = ValueError(
-        f"Invalid MCP_PUBLIC_URL: {public_url!r}. Must be http(s)://host[:port] with no path."
-    )
-    try:
-        parsed = urlparse(public_url)
-        port = parsed.port
-    except ValueError:  # malformed IPv6 brackets or a non-numeric / out-of-range port
-        raise error from None
-    if public_url != public_url.strip() or port == 0:
-        raise error
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise error
-    if parsed.username or parsed.password or parsed.path not in ("", "/"):
-        raise error
-    if parsed.query or parsed.fragment:
-        raise error
-    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-    default_port = 443 if parsed.scheme == "https" else 80
-    if port is not None and port != default_port:
-        return [f"{host}:{port}"], [f"{parsed.scheme}://{host}:{port}"]
-    hosts = [host, f"{host}:{default_port}"]
-    origins = [f"{parsed.scheme}://{host}", f"{parsed.scheme}://{host}:{default_port}"]
-    return hosts, origins
+    host, port = _public_url_parts(public_url)
+    if port is not None and port != 443:
+        return [f"{host}:{port}"], [f"https://{host}:{port}"]
+    return [host, f"{host}:443"], [f"https://{host}", f"https://{host}:443"]
+
+
+def _resource_base_url(host: str, port: int, public_url: str) -> str:
+    """Return the base URL of this server's OAuth resource URLs and authorization metadata.
+
+    Args:
+        host: MCP_HOST.
+        port: MCP_PORT.
+        public_url: MCP_PUBLIC_URL; empty for none.
+
+    Returns:
+        `https://host[:port]` from MCP_PUBLIC_URL, or `http://<loopback host>:<port>` when it is
+        unset. No trailing slash.
+
+    Raises:
+        ValueError: MCP_PUBLIC_URL is malformed.
+        RuntimeError: MCP_HOST is not a loopback address and MCP_PUBLIC_URL is unset.
+    """
+    if public_url:
+        public_host, public_port = _public_url_parts(public_url)
+        if public_port is None or public_port == 443:
+            return f"https://{public_host}"
+        return f"https://{public_host}:{public_port}"
+    if host not in _LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"MCP_HOST={host!r} is not a loopback address: set MCP_PUBLIC_URL to the public "
+            "https URL that clients use."
+        )
+    loopback_host = "[::1]" if host == "::1" else host
+    return f"http://{loopback_host}:{port}"
 
 
 def _transport_security(public_url: str) -> "TransportSecuritySettings":
@@ -154,13 +224,13 @@ def _http_settings() -> dict[str, Any]:
     """Read and validate the HTTP-mode settings passed to FastMCP.
 
     Returns:
-        FastMCP keyword arguments: `host`, `port` and a loopback-only `transport_security`.
+        FastMCP keyword arguments `host`, `port` and `transport_security` (loopback plus the
+        MCP_PUBLIC_URL host), and `resource_base_url`, which the caller removes before FastMCP.
 
     Raises:
         ValueError: MCP_PORT is not a port number, or MCP_PUBLIC_URL fails the checks in
-            `_public_url_entries`.
-        RuntimeError: MCP_HOST is not a loopback address, or MCP_PUBLIC_URL is set; HTTP mode
-            has no caller authentication yet.
+            `_public_url_parts`.
+        RuntimeError: MCP_HOST is not a loopback address and MCP_PUBLIC_URL is unset.
     """
     host = os.environ.get("MCP_HOST", "127.0.0.1")
     port_raw = os.environ.get("MCP_PORT", "8000")
@@ -170,30 +240,26 @@ def _http_settings() -> dict[str, Any]:
         raise ValueError(f"Invalid MCP_PORT: {port_raw!r}. Must be a port number.") from None
     if not 1 <= port <= 65535:
         raise ValueError(f"Invalid MCP_PORT: {port_raw!r}. Must be a port number.")
-    if host not in _LOOPBACK_HOSTS:
-        raise RuntimeError(
-            f"Refusing MCP_HOST={host!r}: HTTP mode has no caller authentication yet; "
-            "set MCP_HOST to 127.0.0.1, localhost or ::1."
-        )
     public_url = os.environ.get("MCP_PUBLIC_URL", "")
-    security = _transport_security(public_url)
-    if public_url:
-        raise RuntimeError(
-            f"Refusing MCP_PUBLIC_URL={public_url!r}: HTTP mode has no caller authentication yet, "
-            "so a public URL would expose Zendesk to anyone who reaches it. Unset it."
-        )
-    return {"host": host, "port": port, "transport_security": security}
+    return {
+        "host": host,
+        "port": port,
+        "transport_security": _transport_security(public_url),
+        "resource_base_url": _resource_base_url(host, port, public_url),
+    }
 
 
 if TRANSPORT == "stdio":
     mcp = FastMCP("zendesk")
 else:
+    _http_config = _http_settings()
+    RESOURCE_BASE_URL: str = _http_config.pop("resource_base_url")
     mcp = FastMCP(
         "zendesk",
         stateless_http=True,
         json_response=True,
         streamable_http_path=CLAUDE_CODE_PATH,
-        **_http_settings(),
+        **_http_config,
     )
 
 
@@ -273,6 +339,43 @@ def _http_doc_remove(phrase: str, replacement: str) -> Callable[[ToolFunction], 
     return decorate
 
 
+_HTTP_WRITE_SCOPE_NOTE = (
+    "Over HTTP this tool needs an OAuth token with the `write` scope. Tokens issued through "
+    "/zendesk/mcp normally have only `read`, so the tool refuses them."
+)
+
+
+def _http_doc_needs_write_scope() -> Callable[[ToolFunction], ToolFunction]:
+    """Add the `write` scope requirement to a write tool's docstring in HTTP mode.
+
+    The note goes in its own paragraph just before the `Args:` section. Stdio docstrings stay
+    exactly as written.
+
+    Returns:
+        A decorator that rewrites `fn.__doc__` in HTTP mode and is a no-op in stdio mode.
+
+    Raises:
+        RuntimeError: In HTTP mode, the docstring does not have exactly one `Args:` line.
+    """
+
+    def decorate(fn: ToolFunction) -> ToolFunction:
+        if TRANSPORT == "stdio":
+            return fn
+        doc = fn.__doc__ or ""
+        pattern = r"\n([ \t]*)Args:"
+        if len(re.findall(pattern, doc)) != 1:
+            raise RuntimeError(f"{fn.__name__}: expected exactly one 'Args:' line in the docstring")
+        fn.__doc__ = re.sub(
+            pattern,
+            lambda match: f"\n{match.group(1)}{_HTTP_WRITE_SCOPE_NOTE}\n\n{match.group(1)}Args:",
+            doc,
+            count=1,
+        )
+        return fn
+
+    return decorate
+
+
 if TRANSPORT == "stdio":
     _COMMENTS_TOO_LARGE_HINT = "Use export_ticket_comments to write the thread to a local file."
 else:
@@ -281,10 +384,16 @@ else:
         "on this server."
     )
 
+# HTTP mode serves many callers through this one client, so its jar refuses every cookie: a
+# Set-Cookie on one caller's response must never ride along on another caller's request.
+_client_cookies = (
+    None if TRANSPORT == "stdio" else CookieJar(DefaultCookiePolicy(allowed_domains=[]))
+)
 _client = httpx.Client(
     base_url=BASE_URL,
     timeout=30.0,
     headers={"Accept": "application/json"},
+    cookies=_client_cookies,
 )
 
 
@@ -292,26 +401,82 @@ _client = httpx.Client(
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
-# Admits httpx.Auth so a later change can return a bearer-token auth object without new annotations.
 ZendeskAuth = tuple[str, str] | httpx.Auth
+
+
+class _BearerAuth(httpx.Auth):
+    """Send an OAuth access token as `Authorization: Bearer`. Its repr never shows the token."""
+
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    def __repr__(self) -> str:
+        return "_BearerAuth(<redacted>)"
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        request.headers["Authorization"] = f"Bearer {self._token}"
+        yield request
+
+
+def _caller_access_token() -> "AccessToken":
+    """Return the verified OAuth token of the HTTP request being served.
+
+    Reads the user that the auth middleware stored in the ASGI scope, which reaches the tool
+    through the MCP request context. Call it in the tool's own thread: worker threads have no
+    request context. The SDK's `get_access_token()` returns None here, because this server does
+    not install `AuthContextMiddleware`.
+
+    Returns:
+        The caller's verified access token (its `token` and `scopes`).
+
+    Raises:
+        RuntimeError: No HTTP request, or the request has no authenticated user.
+    """
+    from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
+    try:
+        request = mcp.get_context().request_context.request
+    except ValueError:  # no MCP request in this thread
+        request = None
+    user = None if request is None else request.scope.get("user")
+    if isinstance(user, AuthenticatedUser):
+        return user.access_token
+    raise RuntimeError("No authenticated caller for this request; refusing it.")
+
+
+def _require_write_scope() -> None:
+    """Refuse a write tool call over HTTP when the caller's token lacks the `write` scope.
+
+    Call it first in every tool that changes Zendesk data. Stdio has no OAuth token, so it does
+    nothing there; ACCESS_LEVEL still decides which write tools exist in either mode.
+
+    Raises:
+        PermissionError: HTTP mode, and the token's scopes do not include `write`.
+        RuntimeError: HTTP mode, and the call has no authenticated caller.
+    """
+    if TRANSPORT == "stdio":
+        return
+    if "write" not in _caller_access_token().scopes:
+        raise PermissionError(
+            "This tool changes Zendesk data, and your OAuth token has no `write` scope. "
+            "Sign in again through /claude/mcp to get a token with write access."
+        )
 
 
 def _zendesk_auth() -> ZendeskAuth:
     """Return the credentials to send with the current Zendesk request.
 
     Returns:
-        The basic-auth tuple ``("<email>/token", api_key)``. A later change will return the
-        caller's bearer token when the server runs over HTTP; call sites must not change.
+        In stdio mode, the basic-auth tuple ``("<email>/token", api_key)``. In HTTP mode, the
+        caller's own OAuth token as bearer auth; HTTP mode never uses the API-token credentials.
 
     Raises:
-        RuntimeError: HTTP mode without both ZENDESK_EMAIL and ZENDESK_API_KEY. No request is sent.
+        RuntimeError: HTTP mode, and the call has no authenticated caller (including a worker
+            thread). No request is sent.
     """
-    if TRANSPORT == "stdio" or (EMAIL and API_KEY):
+    if TRANSPORT == "stdio":
         return (f"{EMAIL}/token", API_KEY)
-    raise RuntimeError(
-        "No Zendesk credentials for this request: set ZENDESK_EMAIL and ZENDESK_API_KEY "
-        "for a local HTTP run."
-    )
+    return _BearerAuth(_caller_access_token().token)
 
 
 def _get(path: str, params: dict | None = None) -> dict:
@@ -1512,6 +1677,7 @@ def _resolve_attachment_paths(file_paths: list[str]) -> list[Path]:
 if ACCESS_LEVEL in ("management", "admin"):
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def create_ticket(
         subject: str,
         body: str,
@@ -1534,6 +1700,7 @@ if ACCESS_LEVEL in ("management", "admin"):
             assignee_id: User ID to assign the ticket to. Optional.
             group_id: Group ID to assign the ticket to. Optional.
         """
+        _require_write_scope()
         ticket: dict = {
             "subject": subject,
             "comment": {"body": body},
@@ -1556,6 +1723,7 @@ if ACCESS_LEVEL in ("management", "admin"):
         return json.dumps({"id": t["id"], "subject": t["subject"], "status": t["status"]}, indent=2)
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def update_ticket(
         ticket_id: int,
         status: str | None = None,
@@ -1582,6 +1750,7 @@ if ACCESS_LEVEL in ("management", "admin"):
             tags: Replace all tags with this list.
             custom_fields: List of {"id": field_id, "value": value} dicts.
         """
+        _require_write_scope()
         ticket: dict = {}
         if status:
             ticket["status"] = status
@@ -1617,6 +1786,7 @@ if ACCESS_LEVEL in ("management", "admin"):
         )
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def add_ticket_comment(
         ticket_id: int,
         body: str,
@@ -1629,6 +1799,7 @@ if ACCESS_LEVEL in ("management", "admin"):
             body: The comment text.
             public: True for a public reply (visible to requester), False for an internal note.
         """
+        _require_write_scope()
         data = _put(
             f"/tickets/{ticket_id}.json",
             {
@@ -1648,6 +1819,7 @@ if ACCESS_LEVEL in ("management", "admin"):
         )
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def add_ticket_tags(ticket_id: int, tags: list[str]) -> str:
         """Add tags to a ticket without removing existing ones.
 
@@ -1655,6 +1827,7 @@ if ACCESS_LEVEL in ("management", "admin"):
             ticket_id: The ticket to tag.
             tags: Tags to add.
         """
+        _require_write_scope()
         existing = _get(f"/tickets/{ticket_id}.json")
         current_tags = existing["ticket"].get("tags", [])
         merged = list(set(current_tags + tags))
@@ -1662,6 +1835,7 @@ if ACCESS_LEVEL in ("management", "admin"):
         return json.dumps({"id": ticket_id, "tags": data["ticket"].get("tags", [])}, indent=2)
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def remove_ticket_tags(ticket_id: int, tags: list[str]) -> str:
         """Remove specific tags from a ticket.
 
@@ -1669,6 +1843,7 @@ if ACCESS_LEVEL in ("management", "admin"):
             ticket_id: The ticket to update.
             tags: Tags to remove.
         """
+        _require_write_scope()
         existing = _get(f"/tickets/{ticket_id}.json")
         current_tags = existing["ticket"].get("tags", [])
         updated = [t for t in current_tags if t not in tags]
@@ -1676,6 +1851,7 @@ if ACCESS_LEVEL in ("management", "admin"):
         return json.dumps({"id": ticket_id, "tags": data["ticket"].get("tags", [])}, indent=2)
 
     @_stdio_only_tool()
+    @_http_doc_needs_write_scope()
     def attach_file_to_ticket(
         ticket_id: int,
         file_paths: list[str],
@@ -1699,6 +1875,7 @@ if ACCESS_LEVEL in ("management", "admin"):
                 comment to carry attachments, so this cannot be empty.
             public: True for a public reply (visible to requester), False for an internal note.
         """
+        _require_write_scope()
         if not comment.strip():
             raise ValueError("comment must not be empty; Zendesk attaches files via a comment.")
         files = _resolve_attachment_paths(file_paths)
@@ -1740,6 +1917,7 @@ if ACCESS_LEVEL in ("management", "admin"):
 if ACCESS_LEVEL == "admin":
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def merge_tickets(target_ticket_id: int, source_ticket_ids: list[int]) -> str:
         """Merge one or more tickets into a target ticket.
 
@@ -1749,6 +1927,7 @@ if ACCESS_LEVEL == "admin":
             target_ticket_id: The ticket that will remain open and receive merged content.
             source_ticket_ids: Ticket IDs to merge into the target.
         """
+        _require_write_scope()
         data = _post(
             f"/tickets/{target_ticket_id}/merge.json",
             {
@@ -1765,6 +1944,7 @@ if ACCESS_LEVEL == "admin":
         )
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def create_user(
         name: str,
         email: str,
@@ -1781,6 +1961,7 @@ if ACCESS_LEVEL == "admin":
             organization_id: Organization to assign the user to. Optional.
             tags: Tags to apply to the user. Optional.
         """
+        _require_write_scope()
         user: dict = {"name": name, "email": email, "role": role}
         if organization_id:
             user["organization_id"] = organization_id
@@ -1800,6 +1981,7 @@ if ACCESS_LEVEL == "admin":
         )
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def update_user(
         user_id: int,
         name: str | None = None,
@@ -1818,6 +2000,7 @@ if ACCESS_LEVEL == "admin":
             organization_id: New organization. Optional.
             tags: Replace all tags with this list. Optional.
         """
+        _require_write_scope()
         user: dict = {}
         if name:
             user["name"] = name
@@ -1884,6 +2067,7 @@ if ACCESS_LEVEL == "admin":
         return json.dumps(orgs, indent=2)
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def create_organization(
         name: str,
         domain_names: list[str] | None = None,
@@ -1896,6 +2080,7 @@ if ACCESS_LEVEL == "admin":
             domain_names: Associated domain names (e.g. ["acme.com"]). Optional.
             tags: Tags to apply. Optional.
         """
+        _require_write_scope()
         org: dict = {"name": name}
         if domain_names:
             org["domain_names"] = domain_names
@@ -1914,6 +2099,7 @@ if ACCESS_LEVEL == "admin":
         )
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def update_organization(
         organization_id: int,
         name: str | None = None,
@@ -1928,6 +2114,7 @@ if ACCESS_LEVEL == "admin":
             domain_names: New domain names list. Optional.
             tags: Replace all tags with this list. Optional.
         """
+        _require_write_scope()
         org: dict = {}
         if name:
             org["name"] = name
@@ -1952,15 +2139,18 @@ if ACCESS_LEVEL == "admin":
         )
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def delete_ticket(ticket_id: int) -> str:
         """Permanently delete a Zendesk ticket. This cannot be undone.
 
         Args:
             ticket_id: The ticket to delete.
         """
+        _require_write_scope()
         return _delete(f"/tickets/{ticket_id}.json")
 
     @mcp.tool()
+    @_http_doc_needs_write_scope()
     def bulk_update_tickets(
         ticket_ids: list[int],
         status: str | None = None,
@@ -1979,6 +2169,7 @@ if ACCESS_LEVEL == "admin":
             group_id: Reassign all tickets to this group. Optional.
             tags: Replace tags on all tickets. Optional.
         """
+        _require_write_scope()
         if len(ticket_ids) > 100:
             return "Error: Maximum 100 tickets per bulk update."
 
@@ -2009,9 +2200,25 @@ if ACCESS_LEVEL == "admin":
 
 
 if TRANSPORT == "streamable-http":
+    import hashlib
+    from datetime import datetime, timezone
+
+    import anyio
+    from mcp.server.auth.handlers.metadata import MetadataHandler
+    from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend, RequireAuthMiddleware
+    from mcp.server.auth.provider import AccessToken, TokenVerifier
+    from mcp.server.auth.routes import (
+        build_resource_metadata_url,
+        cors_middleware,
+        create_protected_resource_routes,
+    )
+    from mcp.shared.auth import OAuthMetadata
+    from pydantic import AnyHttpUrl, Field
     from starlette.applications import Starlette
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse
+    from starlette.authentication import AuthenticationError
+    from starlette.middleware.authentication import AuthenticationMiddleware
+    from starlette.requests import HTTPConnection, Request
+    from starlette.responses import JSONResponse, RedirectResponse, Response
     from starlette.routing import Route
     from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -2027,6 +2234,177 @@ if TRANSPORT == "streamable-http":
 
         async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
             await self.app({**scope, _ENDPOINT_SCOPE_KEY: self.endpoint}, receive, send)
+
+    # Every token must carry `read`; the SDK answers 403 insufficient_scope otherwise.
+    _REQUIRED_SCOPES = ["read"]
+    _TOKEN_CACHE_SECONDS = 60
+    _TOKEN_CACHE_MAX_ENTRIES = 1024
+    _TOKEN_CHECK_TIMEOUT_SECONDS = 10.0
+
+    class ZendeskAccessToken(AccessToken):
+        """An AccessToken that also records the Zendesk user the token acts as.
+
+        The token is left out of repr, str, rich output and `model_dump`, so formatting or
+        dumping this object never reveals it; read it as the `token` attribute only.
+        """
+
+        token: str = Field(repr=False, exclude=True)
+        user_id: int
+
+    class ZendeskUnavailable(AuthenticationError):
+        """Zendesk could not check a token (429, 5xx, timeout or network error)."""
+
+    def _parse_expires_at(value: object) -> int | None:
+        """Turn Zendesk's `expires_at` (e.g. `2026-11-11T20:52:43Z`) into epoch seconds.
+
+        Args:
+            value: The `expires_at` field of a `tokens/current` answer.
+
+        Returns:
+            Epoch seconds (UTC), or None when the value is missing or not in that format.
+        """
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            return None
+        return int(parsed.replace(tzinfo=timezone.utc).timestamp())
+
+    class ZendeskTokenVerifier(TokenVerifier):
+        """Check bearer tokens with Zendesk `GET /api/v2/oauth/tokens/current`.
+
+        Valid results are cached by SHA-256 of the token for up to `_TOKEN_CACHE_SECONDS`, never
+        past the token's `expires_at`, with at most `_TOKEN_CACHE_MAX_ENTRIES` entries. Invalid
+        results are not cached. Tokens never appear in logs, reprs or exception text.
+        """
+
+        def __init__(self) -> None:
+            self._cache: dict[str, tuple[ZendeskAccessToken, float]] = {}
+
+        async def verify_token(self, token: str) -> AccessToken | None:
+            """Return the token's details if Zendesk accepts it.
+
+            Args:
+                token: The bearer token from the request.
+
+            Returns:
+                A ZendeskAccessToken, or None when the token is not valid: Zendesk answered
+                something other than 200, 429 or 5xx, or the token belongs to another OAuth client.
+
+            Raises:
+                ZendeskUnavailable: Zendesk answered 429 or 5xx, or could not be reached. The
+                    client gets 503, not 401, so it keeps its token.
+            """
+            cache_key = hashlib.sha256(token.encode()).hexdigest()
+            now = time.time()
+            cached = self._cache.get(cache_key)
+            if cached is not None and cached[1] > now:
+                return cached[0]
+            self._cache.pop(cache_key, None)
+            access_token = await anyio.to_thread.run_sync(_fetch_token_info, token)
+            if access_token is None:
+                return None
+            cache_until = now + _TOKEN_CACHE_SECONDS
+            if access_token.expires_at is not None:
+                cache_until = min(cache_until, access_token.expires_at)
+            self._store(cache_key, access_token, cache_until)
+            return access_token
+
+        def _store(self, cache_key: str, access_token: ZendeskAccessToken, until: float) -> None:
+            """Cache one result, dropping the oldest entries when full.
+
+            Args:
+                cache_key: SHA-256 hex digest of the token.
+                access_token: The verified token details.
+                until: Epoch seconds after which the entry is stale.
+            """
+            while len(self._cache) >= _TOKEN_CACHE_MAX_ENTRIES:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[cache_key] = (access_token, until)
+
+    def _fetch_token_info(token: str) -> "ZendeskAccessToken | None":
+        """Ask Zendesk about one token, through the shared client (runs in a worker thread).
+
+        Args:
+            token: The bearer token to check.
+
+        Returns:
+            The token's details on a 200 for the pinned OAuth client. None on any other status
+            except 429 and 5xx, or when the token belongs to another OAuth client.
+
+        Raises:
+            ZendeskUnavailable: 429, 5xx, a malformed 200 body, or a transport error.
+        """
+        try:
+            response = _client.get(
+                "/oauth/tokens/current.json",
+                auth=_BearerAuth(token),
+                timeout=_TOKEN_CHECK_TIMEOUT_SECONDS,
+            )
+        except httpx.HTTPError as error:
+            raise ZendeskUnavailable(
+                f"Zendesk token check failed: {type(error).__name__}"
+            ) from None
+        status = response.status_code
+        if status == 429 or status >= 500:
+            raise ZendeskUnavailable(f"Zendesk token check returned {status}")
+        if status != 200:
+            return None
+        try:
+            info = response.json()["token"]
+            if str(info["client_id"]) != OAUTH_CLIENT_ID:
+                return None  # a token from another OAuth client on this Zendesk instance
+            return ZendeskAccessToken(
+                token=token,
+                client_id=str(info["client_id"]),
+                scopes=[str(scope) for scope in info["scopes"]],
+                expires_at=_parse_expires_at(info.get("expires_at")),
+                user_id=int(info["user_id"]),
+            )
+        except (ValueError, KeyError, TypeError):
+            raise ZendeskUnavailable("Zendesk token check returned an unreadable body") from None
+
+    def _token_check_unavailable(conn: HTTPConnection, error: AuthenticationError) -> JSONResponse:
+        """Answer 503 when Zendesk could not check the token, so the client keeps it and retries.
+
+        Args:
+            conn: The request (unused).
+            error: The error from the verifier; its text names no token.
+
+        Returns:
+            A 503 JSON response with Retry-After.
+        """
+        return JSONResponse(
+            {"error": "temporarily_unavailable", "error_description": str(error)},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+
+    _token_verifier = ZendeskTokenVerifier()
+
+    # Clients request the scopes a resource advertises: Zendesk flows get read-only tokens.
+    _SCOPES_SUPPORTED = {ZENDESK_FLOW_PATH: ["read"], CLAUDE_CODE_PATH: ["read", "write"]}
+    _ROOT_SCOPES_SUPPORTED = ["read"]
+    _ZENDESK_OAUTH_URL = f"https://{SUBDOMAIN}.zendesk.com/oauth"
+    _AUTHORIZE_PATH = "/oauth/authorize"
+
+    def _require_caller_auth(endpoint_app: ASGIApp, path: str) -> ASGIApp:
+        """Wrap one endpoint so it answers 401 without a Zendesk token that has every required scope.
+
+        Args:
+            endpoint_app: The tagged MCP transport endpoint.
+            path: The endpoint path; its metadata URL goes in the 401 `WWW-Authenticate` header.
+
+        Returns:
+            The endpoint behind AuthenticationMiddleware and RequireAuthMiddleware.
+        """
+        metadata_url = build_resource_metadata_url(AnyHttpUrl(RESOURCE_BASE_URL + path))
+        return AuthenticationMiddleware(
+            RequireAuthMiddleware(endpoint_app, _REQUIRED_SCOPES, metadata_url),
+            backend=BearerAuthBackend(_token_verifier),
+            on_error=_token_check_unavailable,
+        )
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> JSONResponse:
@@ -2045,7 +2423,10 @@ if TRANSPORT == "streamable-http":
 
         Returns:
             The FastMCP Starlette app, with its single MCP route replaced by two routes that
-            share the same transport endpoint and session manager.
+            share the same transport endpoint and session manager. Each route is tagged with its
+            endpoint and wrapped by `_require_caller_auth`, so it answers 401 without a valid
+            Zendesk token. The OAuth discovery routes and the `/oauth/authorize` redirect from
+            `_oauth_metadata_routes` are appended.
 
         Raises:
             RuntimeError: The SDK app does not have exactly one MCP route to replace.
@@ -2063,13 +2444,81 @@ if TRANSPORT == "streamable-http":
         transport_endpoint = http_app.router.routes[index].endpoint
         http_app.router.routes[index : index + 1] = [
             Route(
-                ZENDESK_FLOW_PATH, endpoint=_EndpointTag(transport_endpoint, Endpoint.ZENDESK_FLOW)
+                ZENDESK_FLOW_PATH,
+                endpoint=_require_caller_auth(
+                    _EndpointTag(transport_endpoint, Endpoint.ZENDESK_FLOW), ZENDESK_FLOW_PATH
+                ),
             ),
             Route(
-                CLAUDE_CODE_PATH, endpoint=_EndpointTag(transport_endpoint, Endpoint.CLAUDE_CODE)
+                CLAUDE_CODE_PATH,
+                endpoint=_require_caller_auth(
+                    _EndpointTag(transport_endpoint, Endpoint.CLAUDE_CODE), CLAUDE_CODE_PATH
+                ),
             ),
         ]
+        http_app.router.routes.extend(_oauth_metadata_routes())
         return http_app
+
+    def _oauth_metadata_routes() -> list[Route]:
+        """Build the OAuth discovery routes and the authorize redirect.
+
+        Returns:
+            Protected resource metadata for each endpoint path and the root, authorization
+            server metadata naming Zendesk's token endpoint, and the authorize redirect.
+        """
+        base = AnyHttpUrl(RESOURCE_BASE_URL)
+        routes: list[Route] = []
+        for path, scopes in _SCOPES_SUPPORTED.items():
+            routes += create_protected_resource_routes(
+                AnyHttpUrl(RESOURCE_BASE_URL + path), [base], scopes_supported=scopes
+            )
+        routes += create_protected_resource_routes(
+            base, [base], scopes_supported=_ROOT_SCOPES_SUPPORTED
+        )
+        metadata = OAuthMetadata(
+            issuer=base,
+            authorization_endpoint=AnyHttpUrl(RESOURCE_BASE_URL + _AUTHORIZE_PATH),
+            token_endpoint=AnyHttpUrl(f"{_ZENDESK_OAUTH_URL}/tokens"),
+            scopes_supported=["read", "write"],
+            grant_types_supported=["authorization_code", "refresh_token"],
+            token_endpoint_auth_methods_supported=["client_secret_post"],
+            code_challenge_methods_supported=["S256"],
+        )
+        metadata_endpoint = cors_middleware(MetadataHandler(metadata).handle, ["GET", "OPTIONS"])
+        routes.append(
+            Route(
+                "/.well-known/oauth-authorization-server",
+                endpoint=metadata_endpoint,
+                methods=["GET", "OPTIONS"],
+            )
+        )
+        routes.append(Route(_AUTHORIZE_PATH, endpoint=_authorize_redirect, methods=["GET"]))
+        return routes
+
+    async def _authorize_redirect(request: Request) -> Response:
+        """Send the browser to Zendesk's authorize page without the `resource` parameter.
+
+        Zendesk's authorize endpoint rejects RFC 8707 `resource` for ordinary OAuth clients; its
+        token endpoint accepts it. The target host is fixed from ZENDESK_SUBDOMAIN, and every
+        other percent-encoded query parameter passes through unchanged (raw non-ASCII bytes come
+        out percent-encoded), so Zendesk still checks `redirect_uri`, PKCE and `state`.
+
+        Args:
+            request: The GET request from the user's browser.
+
+        Returns:
+            A 302 redirect to `https://<subdomain>.zendesk.com/oauth/authorizations/new`.
+        """
+        query = request.scope.get("query_string", b"").decode("latin-1")
+        kept: list[str] = []
+        for segment in query.split("&"):
+            name = unquote_plus(segment.split("=", 1)[0])
+            if segment and name != "resource":
+                kept.append(segment)
+        target = f"{_ZENDESK_OAUTH_URL}/authorizations/new"
+        if kept:
+            target += "?" + "&".join(kept)
+        return RedirectResponse(target, status_code=302)
 
     app = _build_http_app()
 
