@@ -127,7 +127,7 @@ Run:
 cd ~/.claude/mcp-servers/zendesk && .venv/bin/python -c "import server; print('Server loaded OK')"
 ```
 
-If this fails with a `KeyError`, the `.env` file is missing values (in HTTP mode that includes `ZENDESK_OAUTH_CLIENT_ID`). If it fails with `ValueError`, `ACCESS_LEVEL` or `MCP_TRANSPORT` (or, in HTTP mode, `MCP_PORT`, `MCP_PUBLIC_URL` or a non-numeric `ZENDESK_OAUTH_CLIENT_ID`) is invalid. A `RuntimeError` in HTTP mode means `MCP_HOST` is not a loopback address and `MCP_PUBLIC_URL` is unset.
+If this fails with a `KeyError`, the `.env` file is missing values (in HTTP mode that includes `ZENDESK_OAUTH_CLIENT_ID`). If it fails with `ValueError`, `ACCESS_LEVEL` or `MCP_TRANSPORT` (or, in HTTP mode, `MCP_PORT`, `MCP_PUBLIC_URL`, `MCP_ZENDESK_FLOW_BUDGET_SECONDS` or a non-numeric `ZENDESK_OAUTH_CLIENT_ID`) is invalid. A `RuntimeError` in HTTP mode means `MCP_HOST` is not a loopback address and `MCP_PUBLIC_URL` is unset.
 
 ### Step 5: Register with Claude Code
 
@@ -196,6 +196,16 @@ MCP_TRANSPORT=streamable-http .venv/bin/python server.py
 - **Local Claude Code login:** `claude mcp add --transport http zendesk-local http://127.0.0.1:8000/claude/mcp --client-id zendesk_mcp --client-secret --callback-port 8765`, then `claude mcp login zendesk-local` in a terminal. This is the minimum to try it; full client setup docs are still to come.
 - For several workers run `MCP_TRANSPORT=streamable-http uvicorn server:app --workers 2 --host 127.0.0.1 --port 8000`. `MCP_TRANSPORT` must be set, or `app` does not exist. Pass the same `--host` as `MCP_HOST` and the same `--port` as `MCP_PORT`: the loopback OAuth resource and issuer URLs are built from them. Each worker keeps its own token cache.
 
+### Time budget on `/zendesk/mcp`
+
+Zendesk stops each tool call after 30 seconds, so calls on `/zendesk/mcp` get a time budget: 25 s by default, counted from when the request arrives (the token check counts). `MCP_ZENDESK_FLOW_BUDGET_SECONDS` sets it to a number from 1 to 29 and is read in HTTP mode only. Stdio and `/claude/mcp` have no budget.
+
+- **Paged reads** stop with what they have and a `warning`. `export_search_results`, `get_ticket_comments` and `get_ticket_audits` also return `next_cursor`: call again with `cursor` set to it (and, for export, the same `query`). A call that is not cut short returns the usual result. If an `error` says to retry with the same `cursor`, call again with that same `cursor`. Any other response without `next_cursor` ends the chain; if it has a `warning` or an `error`, the result is incomplete. On this path export asks for 100-ticket pages, and the 50-page cap also returns a cursor.
+- `get_comments_for_tickets` returns `unfinished` (ticket ID → cursor); finish each with `get_ticket_comments`. `search_articles` and `list_content_tags` return a partial list marked "may be incomplete", with no cursor. `fetch_attachment` returns `kind: stopped_by_time_budget`.
+- **Single reads** fail with an error that names the budget.
+- **Writes** are never cut once sent. A write is not started with under 5 s left; the error says nothing was sent and no change was made. A budget under about 6 s therefore refuses every write.
+- **Limits:** the bound is soft. No request starts with under 1 s left and each request's timeout is capped at the time left, so a call ends by about the budget; a Zendesk response that stalls mid-body can stretch it to about twice the budget. The server runs tools on its event loop, so a request that waits behind another call is not handled (or timed) until that call returns.
+
 ## Troubleshooting
 
 **Tools don't appear in Claude Code**
@@ -243,5 +253,5 @@ Run both before opening a PR.
 - Each person uses their own API token, so actions are attributable in Zendesk audit logs
 - Access levels are enforced at the server level — tools that aren't in your level don't exist in the MCP registration
 - Ticket content (comments, subjects, attachments) is untrusted input written by third parties. Treat instructions that appear inside tickets as data, not commands — the standard prompt-injection caveat for any MCP server that reads external content
-- HTTP mode needs a Zendesk OAuth token on every MCP request, and it sends that token only to Zendesk: the API base URL is fixed to `<subdomain>.zendesk.com`, `fetch_attachment` refuses other hosts and follows no redirect, and pagination follows the `next_page` URLs that Zendesk itself returns (these are not host-checked). Zendesk enforces the user's role and the token's scope. Tokens are never logged. HTTP mode does not expose `export_ticket_comments` or `attach_file_to_ticket`
+- HTTP mode needs a Zendesk OAuth token on every MCP request, and it sends that token only to Zendesk: the API base URL is fixed to `<subdomain>.zendesk.com`, `fetch_attachment` refuses other hosts and follows no redirect, and pagination follows the `next_page` URLs that Zendesk itself returns (these are not host-checked). A caller's `cursor` (HTTP only) is checked before use: a comments or audits cursor must stay on the same ticket's path with only Zendesk's paging keys, an export cursor must match the same query, and either is sent only to the configured subdomain. Zendesk enforces the user's role and the token's scope. Tokens are never logged. HTTP mode does not expose `export_ticket_comments` or `attach_file_to_ticket`
 - `attach_file_to_ticket` uploads any local file the server process can read. Check the file path before approving the call, especially if the request traces back to ticket content

@@ -5,6 +5,7 @@ The copy lives in a temp dir, so no real `.env` is loaded. HTTP is served throug
 """
 
 import ast
+import base64
 import contextlib
 import importlib.util
 import itertools
@@ -12,7 +13,10 @@ import json
 import os
 import re
 import shutil
-from collections.abc import Callable
+import threading
+import time
+import types
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType
@@ -1199,3 +1203,1228 @@ def test_http_two_callers_each_send_own_token(load_server: Callable[..., ModuleT
     for ticket_id, authorization, cookie in sent:
         assert authorization == f"Bearer {tokens[ticket_owner[ticket_id]]}", ticket_id
         assert cookie is None, ticket_id
+
+
+# Time budget on /zendesk/mcp
+
+
+class _FakeClock:
+    """A thread-safe monotonic clock that only moves when told to; records sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+        self._lock = threading.Lock()
+
+    def monotonic(self) -> float:
+        """Return the current fake time."""
+        with self._lock:
+            return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Move the clock forward."""
+        with self._lock:
+            self.now += seconds
+
+    def sleep(self, seconds: float) -> None:
+        """Record a sleep and advance by it, without waiting."""
+        self.sleeps.append(seconds)
+        self.advance(seconds)
+
+
+def _slow_zendesk(
+    module: ModuleType,
+    clock: _FakeClock,
+    answer: Callable[[httpx.Request], tuple[float, httpx.Response]],
+    token_check_seconds: float = 0.0,
+    scopes: list[str] | None = None,
+) -> list[tuple[float, httpx.Request]]:
+    """Stub Zendesk on the fake clock: each answer takes its latency, or times out at the read cap.
+
+    Returns the (start time, request) list of non-token requests.
+    """
+    sent: list[tuple[float, httpx.Request]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Answer token checks after `token_check_seconds`; others per `answer`."""
+        if request.url.path.endswith("/oauth/tokens/current.json"):
+            clock.advance(token_check_seconds)
+            info = {**TOKEN_INFO, "scopes": scopes or ["read"]}
+            return httpx.Response(200, json={"token": info})
+        sent.append((clock.monotonic(), request))
+        latency, response = answer(request)
+        read_cap = request.extensions["timeout"]["read"]
+        if read_cap is not None and latency > read_cap:
+            clock.advance(read_cap)
+            raise httpx.ReadTimeout("slow", request=request)
+        clock.advance(latency)
+        return response
+
+    module._client = httpx.Client(
+        base_url=module.BASE_URL, timeout=30.0, transport=httpx.MockTransport(handler)
+    )
+    return sent
+
+
+def _with_clock(module: ModuleType, monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
+    """Replace the module's `time` with a fake clock (monotonic, sleep); `time()` stays real.
+
+    Only this module copy sees it, and it works on origin/main too, so red runs fail on
+    assertions rather than on a missing hook.
+    """
+    clock = _FakeClock()
+    fake_time = types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep, time=time.time)
+    monkeypatch.setattr(module, "time", fake_time)
+    return clock
+
+
+def _export_page(request: httpx.Request) -> tuple[float, httpx.Response]:
+    """An export page that takes 10 s and always has more."""
+    page = {"results": [{"id": 1}], "meta": {"has_more": True, "after_cursor": "c"}}
+    return 10.0, httpx.Response(200, json=page)
+
+
+def _tool_text(client: TestClient, path: str, name: str, arguments: dict) -> tuple[bool, str]:
+    """Call a tool over HTTP and return (isError, first text content)."""
+    call = {"name": name, "arguments": arguments}
+    result = _rpc(client, path, "tools/call", call).json()["result"]
+    return result["isError"], result["content"][0]["text"]
+
+
+def _json_object(text: str) -> dict:
+    """Parse a tool answer that must be a JSON object; fail on an assertion otherwise."""
+    try:
+        body = json.loads(text)
+    except json.JSONDecodeError:
+        body = None
+    assert isinstance(body, dict), text[:300]
+    return body
+
+
+def test_flow_export_stops_at_budget(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On /zendesk/mcp the export stops by the budget with partial results and a warning."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    sent = _slow_zendesk(module, clock, _export_page)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        start = clock.monotonic()
+        is_error, text = _tool_text(
+            client, ZENDESK_FLOW_PATH, "export_search_results", {"query": "x"}
+        )
+    body = json.loads(text)
+    assert is_error is False
+    assert body["returned_count"] == 2
+    assert "25 s time budget" in body["warning"]
+    assert clock.monotonic() - start <= 25.0
+    assert [request.extensions["timeout"]["read"] for _, request in sent] == [25.0, 15.0, 5.0]
+
+
+def test_flow_deadline_counts_token_check(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clock starts before the token check: an 8 s check leaves 17 s for the tool."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    sent = _slow_zendesk(module, clock, _export_page, token_check_seconds=8.0)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        start = clock.monotonic()
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, "export_search_results", {"query": "x"})
+    assert json.loads(text)["returned_count"] == 1
+    assert clock.monotonic() - start <= 25.0
+    assert sent[0][1].extensions["timeout"]["read"] == 17.0
+
+
+@pytest.mark.parametrize("path", [CLAUDE_CODE_PATH, "stdio"])
+def test_no_deadline_off_flow_path(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """On /claude/mcp and stdio the same slow export runs to its own caps, client timeout intact."""
+    module = load_server() if path == "stdio" else _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    pages = itertools.count(1)
+
+    def five_pages(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """10 s pages; the fifth is the last."""
+        more = next(pages) < 5
+        page = {"results": [{"id": 1}], "meta": {"has_more": more, "after_cursor": "c"}}
+        return 10.0, httpx.Response(200, json=page)
+
+    if path == "stdio":
+        sent = _slow_zendesk(module, clock, five_pages)
+        is_error, text = anyio.run(
+            _call_in_memory_args, module, "export_search_results", {"query": "x"}
+        )
+    else:
+        sent = _slow_zendesk(module, clock, five_pages)
+        with TestClient(module.app, base_url=BASE_URL) as client:
+            is_error, text = _tool_text(client, path, "export_search_results", {"query": "x"})
+    body = json.loads(text)
+    assert is_error is False
+    assert body["returned_count"] == 5 and "warning" not in body
+    assert {str(request.extensions["timeout"]) for _, request in sent} == {
+        str(httpx.Timeout(30.0).as_dict())
+    }
+    assert sent[0][1].url.params["page[size]"] == "1000"  # flow pages are 100
+
+
+def test_flow_retry_after_longer_than_time_left(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Retry-After that would overrun the budget returns partial results at once, no sleep."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    pages = itertools.count(1)
+
+    def then_429(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """First page fine; then a 429 asking for 30 s."""
+        if next(pages) == 1:
+            return _export_page(request)
+        return 1.0, httpx.Response(429, headers={"retry-after": "30"})
+
+    _slow_zendesk(module, clock, then_429)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, "export_search_results", {"query": "x"})
+    assert _json_object(text)["returned_count"] == 1
+    assert clock.sleeps == []
+
+
+def test_flow_bulk_comments_workers_get_deadline(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Workers carry the deadline: no request starts within 1 s of it; unfetched tickets listed."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+
+    def slow_thread(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Each comment page takes 2 s."""
+        return 2.0, httpx.Response(200, json={"comments": [], "next_page": None})
+
+    sent = _slow_zendesk(module, clock, slow_thread)
+    call = {"ticket_ids": list(range(1, 41)), "max_concurrency": 8}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        start = clock.monotonic()
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, "get_comments_for_tickets", call)
+    body = json.loads(text)
+    assert is_error is False
+    deadline = start + 25.0
+    assert all(started <= deadline - 1.0 for started, _ in sent)
+    assert len(body["comments_by_ticket"]) == 40
+    unfinished = body["unfinished"]
+    assert 0 < len(unfinished) < 40 and "errors" not in body
+    assert unfinished["40"] == "/tickets/40/comments.json"
+    assert "get_ticket_comments" in body["warning"]
+
+
+def test_flow_write_reachable_and_never_clamped(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write-scoped token can write via /zendesk/mcp; the PUT keeps the client timeout, and a
+    write is not started with under 5 s left."""
+    module = _load_http(load_server, ACCESS_LEVEL="management")
+    clock = _with_clock(module, monkeypatch)
+    get_latency = {"value": 1.0}
+
+    def ticket(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """GET takes `get_latency`; PUT 1 s."""
+        latency = get_latency["value"] if request.method == "GET" else 1.0
+        return latency, httpx.Response(200, json={"ticket": {"id": 1, "tags": []}})
+
+    sent = _slow_zendesk(module, clock, ticket, scopes=["read", "write"])
+    arguments = {"ticket_id": 1, "tags": ["x"]}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        assert _tool_text(client, ZENDESK_FLOW_PATH, "add_ticket_tags", arguments)[0] is False
+        put = [request for _, request in sent if request.method == "PUT"]
+        assert put[0].extensions["timeout"] == httpx.Timeout(30.0).as_dict()
+        sent.clear()
+        get_latency["value"] = 21.0
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, "add_ticket_tags", arguments)
+    assert is_error is True and "time budget" in text and "no change was made" in text
+    assert [request.method for _, request in sent] == ["GET"]
+
+
+def test_flow_single_get_errors_at_budget(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single slow GET on /zendesk/mcp gives a tool error that names the budget."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, lambda request: (40.0, httpx.Response(200, json={})))
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, "get_ticket", {"ticket_id": 1})
+    assert is_error is True and "25 s time budget" in text
+
+
+def _paged(kind: str, pages: int, latency: float) -> Callable[[httpx.Request], tuple]:
+    """Stub `pages` pages of comments or audits for any ticket; item ids are 10*page + 1..2."""
+
+    def answer(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Serve the requested page, linking to the next as an absolute Zendesk URL."""
+        page = int(request.url.params.get("page", "1"))
+        items = [{"id": 10 * page + n, "events": [{"type": "Change"}]} for n in (1, 2)]
+        next_page = None
+        if page < pages:
+            next_page = f"https://example.zendesk.com{request.url.path}?page={page + 1}"
+        return latency, httpx.Response(200, json={kind: items, "next_page": next_page})
+
+    return answer
+
+
+def _ids(items: list[dict]) -> list[int]:
+    """Return the ids of a list of comments or audits."""
+    return [item["id"] for item in items]
+
+
+@pytest.mark.parametrize(
+    "tool,kind", [("get_ticket_comments", "comments"), ("get_ticket_audits", "audits")]
+)
+def test_flow_resume_with_cursor_gets_everything(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, tool: str, kind: str
+) -> None:
+    """Calls chained by next_cursor return every item once, in order; the last has no cursor."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, _paged(kind, pages=5, latency=10.0))
+    collected: list[dict] = []
+    cursors: list[str] = []
+    arguments: dict = {"ticket_id": 7}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        for _ in range(5):
+            is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, tool, arguments)
+            assert is_error is False, text
+            body = json.loads(text)
+            if isinstance(body, list):
+                collected += body
+                break
+            collected += body[kind]
+            cursors.append(body["next_cursor"])
+            arguments = {"ticket_id": 7, "cursor": body["next_cursor"]}
+    assert _ids(collected) == [10 * page + n for page in range(1, 6) for n in (1, 2)]
+    assert cursors == [f"/tickets/7/{kind}.json?page=3", f"/tickets/7/{kind}.json?page=5"]
+
+
+def test_flow_bulk_unfinished_resumes_to_full_threads(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bulk partial threads plus get_ticket_comments(cursor) give each full thread exactly once."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, _paged("comments", pages=3, latency=3.0))
+    full = [10 * page + n for page in range(1, 4) for n in (1, 2)]
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        call = {"ticket_ids": [1, 2, 3, 4], "max_concurrency": 1}
+        body = json.loads(
+            _tool_text(client, ZENDESK_FLOW_PATH, "get_comments_for_tickets", call)[1]
+        )
+        assert body.get("unfinished")
+        for ticket_id, cursor in body["unfinished"].items():
+            arguments = {"ticket_id": int(ticket_id), "cursor": cursor}
+            rest = json.loads(
+                _tool_text(client, ZENDESK_FLOW_PATH, "get_ticket_comments", arguments)[1]
+            )
+            body["comments_by_ticket"][ticket_id] += rest
+    for ticket_id in ("1", "2", "3", "4"):
+        assert _ids(body["comments_by_ticket"][ticket_id]) == full, ticket_id
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        "https://evil.com/api/v2/tickets/7/comments.json?page=2",
+        "//evil.com/tickets/7/comments.json",
+        "/tickets/8/comments.json?page=2",
+        "/tickets/7/comments.json?page=2&include=users",
+        "/tickets/7/comments.json\n?page=2",
+        "/tickets/7/comments.json#x",
+        "/tickets/7/comments.json?page=2;include=users",
+        "/tickets/7/comments.json?page=2&page=3",
+        "/tickets/7/comments.json?page=2\x7f",
+    ],
+)
+def test_bad_cursor_is_refused_before_any_request(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, cursor: str
+) -> None:
+    """A cursor this tool did not issue gets an error and sends nothing to any host."""
+    module = _load_http(load_server)
+    seen = _stub_zendesk(module, monkeypatch)
+    arguments = {"ticket_id": 7, "cursor": cursor}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        is_error, text = _tool_text(client, CLAUDE_CODE_PATH, "get_ticket_comments", arguments)
+    assert is_error is False and "Invalid or expired cursor" in _json_object(text).get("error", "")
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "tool,kind", [("get_ticket_comments", "comments"), ("get_ticket_audits", "audits")]
+)
+def test_expired_cursor_gets_cursor_error(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, tool: str, kind: str
+) -> None:
+    """When Zendesk rejects a well-formed cursor (400), the tool says to start over."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, lambda request: (0.1, httpx.Response(400, json={})))
+    arguments = {"ticket_id": 7, "cursor": f"/tickets/7/{kind}.json?page[after]=gone"}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, tool, arguments)
+    assert is_error is False and "start over" in _json_object(text).get("error", "")
+
+
+def test_cursor_param_is_http_only(load_server: Callable[..., ModuleType]) -> None:
+    """HTTP schemas offer `cursor`; stdio schemas and descriptions are exactly as before."""
+    http = {tool.name: tool for tool in anyio.run(_load_http(load_server).mcp.list_tools)}
+    stdio_module = load_server(MCP_TRANSPORT=None)
+    stdio = {tool.name: tool for tool in anyio.run(stdio_module.mcp.list_tools)}
+    stdio_params = {
+        "get_ticket_comments": ["ticket_id"],
+        "get_ticket_audits": ["ticket_id"],
+        "export_search_results": ["query", "max_results"],
+    }
+    for name, params in stdio_params.items():
+        assert "cursor" in http[name].inputSchema["properties"], name
+        assert "next_cursor" in http[name].description, name
+        assert list(stdio[name].inputSchema["properties"]) == params, name
+        assert stdio[name].description == getattr(stdio_module, name).__doc__, name
+
+
+@pytest.mark.parametrize(
+    "tool", ["get_ticket_comments", "get_ticket_audits", "export_search_results"]
+)
+def test_resume_note_covers_retry_and_uncut_result(
+    load_server: Callable[..., ModuleType], tool: str
+) -> None:
+    """The HTTP resume note says to retry a no-progress error and names the uncut result."""
+    http_tools = {item.name: item for item in anyio.run(_load_http(load_server).mcp.list_tools)}
+    description = " ".join(http_tools[tool].description.split())
+    assert "A call that is not cut short returns the usual result." in description
+    assert (
+        "If an `error` says to retry with the same `cursor`, call again with that same `cursor`."
+        in description
+    )
+    assert "Any other response without `next_cursor` ends the chain" in description
+
+
+@pytest.mark.parametrize("tool", ["get_ticket_comments", "get_ticket_audits"])
+def test_flow_no_progress_gives_error_without_cursor(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, tool: str
+) -> None:
+    """If not even one page fits in the budget, the answer is an error with no next_cursor."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, lambda request: (40.0, httpx.Response(200, json={})))
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, tool, {"ticket_id": 7})
+    body = _json_object(text)
+    assert is_error is False and "nothing was fetched" in body["error"]
+    assert "next_cursor" not in body
+
+
+def _offset_cursor(offset: int) -> str:
+    """A realistic Zendesk after_cursor: ~300 characters of base64 with `+`, `/` and `=`."""
+    raw = json.dumps({"offset": offset, "pad": "~?>" * 70}).encode()
+    return base64.b64encode(raw).decode()
+
+
+def _cursor_offset(after_cursor: str) -> int:
+    """Decode `_offset_cursor`."""
+    return json.loads(base64.b64decode(after_cursor))["offset"]
+
+
+def _export_stream(total: int, latency: float) -> Callable[[httpx.Request], tuple]:
+    """Stub the export endpoint over `total` tickets (ids 1..total), honouring page[size].
+
+    Its after_cursor is realistic base64 (see `_offset_cursor`); each page takes `latency` s.
+    """
+
+    def answer(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Serve the page that starts at the after_cursor offset."""
+        after = request.url.params.get("page[after]")
+        offset = 0 if after is None else _cursor_offset(after)
+        size = int(request.url.params["page[size]"])
+        ids = list(range(offset + 1, min(offset + size, total) + 1))
+        next_offset = offset + len(ids)
+        meta = {"has_more": next_offset < total, "after_cursor": _offset_cursor(next_offset)}
+        body = {"results": [{"id": ticket_id} for ticket_id in ids], "meta": meta}
+        return latency, httpx.Response(200, json=body)
+
+    return answer
+
+
+def _export_chain(client: TestClient, arguments: dict) -> tuple[list[int], list[dict]]:
+    """Call export_search_results via /zendesk/mcp, following next_cursor; return ids and bodies."""
+    ids: list[int] = []
+    bodies: list[dict] = []
+    for _ in range(10):
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, "export_search_results", arguments)
+        assert is_error is False, text
+        body = json.loads(text)
+        bodies.append(body)
+        ids += [ticket["id"] for ticket in body["tickets"]]
+        if "next_cursor" not in body:
+            break
+        arguments = {**arguments, "cursor": body["next_cursor"]}
+    return ids, bodies
+
+
+def test_flow_export_resume_gets_everything(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chained export calls return every ticket once, in order, with realistic Zendesk cursors."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    sent = _slow_zendesk(module, clock, _export_stream(total=6000, latency=1.0))
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        ids, bodies = _export_chain(client, {"query": "x", "max_results": 10000})
+    assert ids == list(range(1, 6001))
+    assert len(bodies) == 3 and "warning" not in bodies[-1]
+    assert {request.url.params["page[size]"] for _, request in sent} == {"100"}
+    assert bodies[0]["next_cursor"].split(".")[2] == "7500"
+
+
+def test_flow_export_resume_keeps_max_results_total(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """max_results caps the whole chain: the cursor carries the remaining allowance."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, _export_stream(total=5000, latency=2.0))
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        ids, bodies = _export_chain(client, {"query": "x", "max_results": 2500})
+    assert ids == list(range(1, 2501))
+    assert "the max_results limit" in bodies[-1]["warning"] and "next_cursor" not in bodies[-1]
+
+
+def test_flow_export_page_cap_resumes(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With 100-ticket flow pages, the 50-page cap ends a call with a cursor, not a dead end."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, _export_stream(total=6000, latency=0.1))
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        ids, bodies = _export_chain(client, {"query": "x", "max_results": 10000})
+    assert ids == list(range(1, 6001))
+    assert "request cap" in bodies[0].get("warning", "") and bodies[0]["returned_count"] == 5000
+
+
+def test_stdio_export_keeps_1000_pages(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guard: stdio still asks for 1,000-ticket pages and returns no cursor."""
+    module = load_server()
+    clock = _with_clock(module, monkeypatch)
+    sent = _slow_zendesk(module, clock, _export_stream(total=1500, latency=1.0))
+    _, text = anyio.run(_call_in_memory_args, module, "export_search_results", {"query": "x"})
+    assert [request.url.params["page[size]"] for _, request in sent] == ["1000"]
+    assert json.loads(text)["returned_count"] == 1000
+
+
+def _cut_export_cursor(client: TestClient) -> str:
+    """Make one export call that the budget cuts, and return its next_cursor."""
+    _, text = _tool_text(client, ZENDESK_FLOW_PATH, "export_search_results", {"query": "x"})
+    body = json.loads(text)
+    assert "next_cursor" in body, text
+    return body["next_cursor"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda parts: parts[3],  # Zendesk's cursor alone
+        lambda parts: ".".join([parts[0], "0" * 16, *parts[2:]]),  # another query's digest
+        lambda parts: ".".join([*parts[:2], "10001", parts[3]]),
+        lambda parts: ".".join([*parts[:2], "0", parts[3]]),
+        lambda parts: ".".join(parts) + "&query=y",
+        lambda parts: ".".join([*parts[:3], "https://evil.com/x"]),
+    ],
+    ids=["bare", "other_query", "over_limit", "zero", "query_suffix", "url"],
+)
+def test_bad_export_cursor_is_refused_before_any_request(
+    load_server: Callable[..., ModuleType],
+    monkeypatch: pytest.MonkeyPatch,
+    mutate: Callable[[list[str]], str],
+) -> None:
+    """A malformed, foreign-query or over-limit export cursor sends nothing."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    sent = _slow_zendesk(module, clock, _export_stream(total=5000, latency=10.0))
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        parts = _cut_export_cursor(client).split(".", 3)
+        sent.clear()
+        arguments = {"query": "x", "cursor": mutate(parts)}
+        is_error, text = _tool_text(client, CLAUDE_CODE_PATH, "export_search_results", arguments)
+    assert is_error is False and "Invalid or expired cursor" in _json_object(text).get("error", "")
+    assert sent == []
+
+
+def test_expired_export_cursor_gets_cursor_error(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When Zendesk rejects an expired after_cursor (400), the tool says to start over."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    expired = {"now": False}
+    pages = _export_stream(total=5000, latency=10.0)
+
+    def answer(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Serve pages until the cursor 'expires', then answer 400."""
+        if expired["now"]:
+            return 0.1, httpx.Response(400, json={})
+        return pages(request)
+
+    _slow_zendesk(module, clock, answer)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        cursor = _cut_export_cursor(client)
+        expired["now"] = True
+        arguments = {"query": "x", "cursor": cursor}
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, "export_search_results", arguments)
+    assert is_error is False and "start over" in _json_object(text).get("error", "")
+
+
+def test_flow_export_unresumable_cursor_is_not_handed_out(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If Zendesk's after_cursor would fail our own check, no next_cursor is given."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+
+    def odd_cursor(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """10 s pages whose after_cursor has a character the cursor check refuses."""
+        meta = {"has_more": True, "after_cursor": "abc!def"}
+        return 10.0, httpx.Response(200, json={"results": [{"id": 1}], "meta": meta})
+
+    _slow_zendesk(module, clock, odd_cursor)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, "export_search_results", {"query": "x"})
+    body = json.loads(text)
+    assert body["returned_count"] == 2 and "next_cursor" not in body
+    assert "cannot be resumed" in body["warning"]
+
+
+def test_flow_export_no_progress_gives_error_without_cursor(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If not even one export page fits in the budget, the answer is an error with no cursor."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, _export_stream(total=10, latency=40.0))
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, "export_search_results", {"query": "x"})
+    body = _json_object(text)
+    assert "nothing was fetched" in body["error"] and "next_cursor" not in body
+
+
+def test_flow_no_progress_on_resume_says_keep_cursor(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resumed call that gets no page in time says to retry with the same cursor."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    latency = {"value": 10.0}
+
+    def pages(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Paged comments at the current latency."""
+        return latency["value"], _paged("comments", pages=5, latency=0)(request)[1]
+
+    _slow_zendesk(module, clock, pages)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, "get_ticket_comments", {"ticket_id": 7})
+        cursor = _json_object(text).get("next_cursor")
+        latency["value"] = 40.0
+        arguments = {"ticket_id": 7, "cursor": cursor}
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, "get_ticket_comments", arguments)
+    body = json.loads(text)
+    assert "Retry with the same `cursor`" in body["error"] and "next_cursor" not in body
+
+
+@pytest.mark.parametrize(
+    "next_page,resumable",
+    [
+        ("?page=3&per_page=100", True),
+        ("?page%5Bafter%5D=xyz%3D%3D&page%5Bsize%5D=100", True),
+        ("?page=3&include=users", False),
+    ],
+)
+def test_flow_comments_cursor_round_trip(
+    load_server: Callable[..., ModuleType],
+    monkeypatch: pytest.MonkeyPatch,
+    next_page: str,
+    resumable: bool,
+) -> None:
+    """A next_page shape we would refuse is never handed out; accepted ones resume cleanly."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    calls = itertools.count()
+
+    def answer(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Page 1 links to `next_page`; the next page ends the thread."""
+        first = next(calls) == 0
+        link = f"https://example.zendesk.com/api/v2/tickets/7/comments.json{next_page}"
+        body = {
+            "comments": [{"id": 1 if first else 2}],
+            "next_page": link if first else None,
+        }
+        return (10.0 if first else 20.0), httpx.Response(200, json=body)
+
+    _slow_zendesk(module, clock, answer)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, "get_ticket_comments", {"ticket_id": 7})
+        body = _json_object(text)
+        if not resumable:
+            assert "next_cursor" not in body and "cannot be resumed" in body["warning"]
+            return
+        arguments = {"ticket_id": 7, "cursor": body["next_cursor"]}
+        _, rest = _tool_text(client, ZENDESK_FLOW_PATH, "get_ticket_comments", arguments)
+    assert _ids(body["comments"]) + _ids(json.loads(rest)) == [1, 2]
+
+
+def test_stdio_empty_edge_responses_unchanged(load_server: Callable[..., ModuleType]) -> None:
+    """Guard: stdio keeps the empty-result strings when other caps set truncated_by."""
+    module = load_server()
+
+    def empty_more(request: httpx.Request) -> httpx.Response:
+        """An empty page that claims more but gives no cursor."""
+        return httpx.Response(200, json={"records": [], "results": [], "meta": {"has_more": True}})
+
+    module._client = httpx.Client(
+        base_url=module.BASE_URL, timeout=30.0, transport=httpx.MockTransport(empty_more)
+    )
+    _, tags = anyio.run(_call_in_memory_args, module, "list_content_tags", {})
+    assert tags == "No content tags found."
+
+
+def _articles(request: httpx.Request) -> tuple[float, httpx.Response]:
+    """One article per 10 s page, always with a next page."""
+    page = int(request.url.params.get("page", "1"))
+    body = {"results": [{"id": page}], "count": 99, "next_page": f"{BASE_URL}/x?page={page + 1}"}
+    return 10.0, httpx.Response(200, json=body)
+
+
+def _tags(request: httpx.Request) -> tuple[float, httpx.Response]:
+    """One content tag per 10 s page, always with more."""
+    body = {"records": [{"id": "a", "name": "n"}], "meta": {"has_more": True, "after_cursor": "c"}}
+    return 10.0, httpx.Response(200, json=body)
+
+
+@pytest.mark.parametrize(
+    "tool,arguments,key",
+    [("search_articles", {"query": "x"}, "articles"), ("list_content_tags", {}, "content_tags")],
+)
+@pytest.mark.parametrize("latency", [10.0, 40.0], ids=["partial", "zero"])
+def test_flow_articles_and_tags_partial_without_cursor(
+    load_server: Callable[..., ModuleType],
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    arguments: dict,
+    key: str,
+    latency: float,
+) -> None:
+    """Budget stops give partial results (possibly none) and a 'may be incomplete' warning."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    stub = _articles if tool == "search_articles" else _tags
+    _slow_zendesk(module, clock, lambda request: (latency, stub(request)[1]))
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, tool, arguments)
+    body = _json_object(text)
+    assert len(body[key]) == (2 if latency == 10.0 else 0)
+    assert "may be incomplete" in body["warning"] and "next_cursor" not in body
+
+
+def _fake_attachment_stream(
+    clock: _FakeClock, record: list, chunks: list[bytes], timeout_error: bool = False
+) -> Callable[..., Any]:
+    """Stand in for httpx.stream: each chunk takes 10 s on the fake clock."""
+
+    def fake_stream(method: str, url: str, **kwargs: Any) -> Any:
+        """Record the call's kwargs and stream the chunks, or raise ReadTimeout."""
+        record.append(kwargs)
+        if timeout_error:
+            raise httpx.ReadTimeout("slow")
+
+        def body() -> Iterator[bytes]:
+            """Yield chunks, advancing the clock."""
+            for chunk in chunks:
+                clock.advance(10.0)
+                yield chunk
+
+        response = httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=body(),
+            request=httpx.Request(method, url),
+        )
+        return contextlib.nullcontext(response)
+
+    return fake_stream
+
+
+@pytest.mark.parametrize("timeout_error", [False, True], ids=["mid_stream", "read_timeout"])
+def test_flow_fetch_attachment_stops_by_budget(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, timeout_error: bool
+) -> None:
+    """The flow gets kind stopped_by_time_budget; /claude/mcp keeps 60 s and main's behaviour."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, _tags)
+    record: list[dict] = []
+    fake = _fake_attachment_stream(clock, record, [b"a" * 10] * 5, timeout_error)
+    monkeypatch.setattr(module.httpx, "stream", fake)
+    attachment = {"url": "https://example.zendesk.com/a"}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        flow = _tool_text(client, ZENDESK_FLOW_PATH, "fetch_attachment", attachment)
+        claude = _tool_text(client, CLAUDE_CODE_PATH, "fetch_attachment", attachment)
+        refused = _tool_text(
+            client, ZENDESK_FLOW_PATH, "fetch_attachment", {"url": "https://evil.com/a"}
+        )
+    assert _json_object(flow[1]).get("kind") == "stopped_by_time_budget"
+    assert record[0]["timeout"] <= 25.0 and record[0]["follow_redirects"] is False
+    assert record[1]["timeout"] == 60.0
+    assert claude[0] is timeout_error  # the read timeout still raises off the flow path
+    assert "error" in json.loads(refused[1]) and len(record) == 2
+
+
+def test_flow_retry_after_within_budget_sleeps(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Retry-After that fits in the budget is honoured once, then the call completes."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    calls = itertools.count()
+
+    def answer(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """429 asking for 3 s, then one final page."""
+        if next(calls) == 0:
+            return 1.0, httpx.Response(429, headers={"retry-after": "3"})
+        page = {"results": [{"id": 1}], "meta": {"has_more": False}}
+        return 1.0, httpx.Response(200, json=page)
+
+    _slow_zendesk(module, clock, answer)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, "export_search_results", {"query": "x"})
+    assert clock.sleeps == [3] and json.loads(text)["returned_count"] == 1
+
+
+def test_http_descriptions_document_budget_and_cursor(
+    load_server: Callable[..., ModuleType],
+) -> None:
+    """HTTP descriptions carry the notes and a `cursor:` Args line; stdio ones equal __doc__."""
+    http = {tool.name: tool for tool in anyio.run(_load_http(load_server).mcp.list_tools)}
+    for name in ("export_search_results", "get_ticket_comments", "get_ticket_audits"):
+        lines = [line.strip() for line in http[name].description.splitlines()]
+        args_at = lines.index("Args:")
+        assert any(line.startswith("cursor: HTTP only.") for line in lines[args_at:]), name
+    export = " ".join(http["export_search_results"].description.split())
+    assert "pass the same `query`" in export and "`max_results` is ignored" in export
+    assert "the time budget or the 50-page cap" in export
+    assert "if it has a `warning` or an `error`, the result is incomplete" in export
+    audits = [line.strip() for line in http["get_ticket_audits"].description.splitlines()]
+    assert audits[audits.index("Args:") + 1] == "ticket_id: The Zendesk ticket ID."
+    assert "`returned_count`" in export
+    assert "`unfinished`" in http["get_comments_for_tickets"].description
+    bulk = " ".join(http["get_comments_for_tickets"].description.split())
+    assert "cannot be resumed is listed in `errors`" in bulk
+    assert "over the size limit has a `warning` and no `unfinished`" in bulk
+    comments = " ".join(http["get_ticket_comments"].description.split())
+    assert "or a value from get_comments_for_tickets' `unfinished`" in comments
+    assert "instead of the content" in http["fetch_attachment"].description
+    for name in ("search_articles", "list_content_tags"):
+        assert "stops after 25 s" in http[name].description, name
+    assert "stops after 25 s or at the 50-page cap" in export
+    assert "stops after 25 s and" in " ".join(http["get_ticket_comments"].description.split())
+    budget_tools = (
+        "export_search_results",
+        "get_ticket_comments",
+        "get_ticket_audits",
+        "get_comments_for_tickets",
+        "fetch_attachment",
+        "search_articles",
+        "list_content_tags",
+    )
+    for name in budget_tools:
+        lines = http[name].description.splitlines()
+        body_indent = re.match(r"[ \t]*", next(line for line in lines[1:] if line.strip()))
+        note = next(line for line in lines if "On /zendesk/mcp" in line)
+        # Python 3.13+ strips docstring indentation; older versions keep it.
+        assert note.startswith(body_indent.group() + "On /zendesk/mcp"), name
+    stdio_module = load_server(MCP_TRANSPORT=None)
+    for tool in anyio.run(stdio_module.mcp.list_tools):
+        assert tool.description == getattr(stdio_module, tool.name).__doc__, tool.name
+        assert "/zendesk/mcp" not in tool.description, tool.name
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "30", "nan", "0.5"])
+def test_flow_budget_env_validation(load_server: Callable[..., ModuleType], value: str) -> None:
+    """HTTP mode refuses a budget outside 1-29 at import; stdio ignores the variable."""
+    with pytest.raises(ValueError, match="MCP_ZENDESK_FLOW_BUDGET_SECONDS"):
+        load_server(MCP_TRANSPORT="streamable-http", MCP_ZENDESK_FLOW_BUDGET_SECONDS=value)
+    load_server(MCP_TRANSPORT=None, MCP_ZENDESK_FLOW_BUDGET_SECONDS=value)
+    http = _load_http(load_server, MCP_ZENDESK_FLOW_BUDGET_SECONDS="3")
+    assert http.ZENDESK_FLOW_BUDGET_SECONDS == 3.0
+
+
+def test_flow_export_resume_ending_empty_stays_json(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resumed export whose page is empty answers JSON with returned_count 0, not a string."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    pages = _export_stream(total=200, latency=10.0)
+
+    def answer(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Two full pages, then an empty last page (Zendesk's count shrank)."""
+        if (
+            request.url.params.get("page[after]")
+            and _cursor_offset(request.url.params["page[after]"]) >= 200
+        ):
+            meta = {"has_more": False, "after_cursor": None}
+            return 10.0, httpx.Response(200, json={"results": [], "meta": meta})
+        latency, response = pages(request)
+        body = response.json()
+        body["meta"]["has_more"] = True
+        return latency, httpx.Response(200, json=body)
+
+    _slow_zendesk(module, clock, answer)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        ids, bodies = _export_chain(client, {"query": "x"})
+    assert ids == list(range(1, 201))
+    assert bodies[-1] == {"returned_count": 0, "tickets": []}
+
+
+@pytest.mark.parametrize(
+    "tool,kind", [("get_ticket_comments", "comments"), ("get_ticket_audits", "audits")]
+)
+def test_flow_later_page_error_is_not_a_cursor_error(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, tool: str, kind: str
+) -> None:
+    """On a resumed call, a 404 on a later page is not reported as an invalid cursor."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    paged = _paged(kind, pages=5, latency=1.0)
+
+    def answer(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Page 3 is missing; the others are served."""
+        if request.url.params.get("page") == "3":
+            return 1.0, httpx.Response(404, json={"error": "gone"})
+        return paged(request)
+
+    _slow_zendesk(module, clock, answer)
+    arguments = {"ticket_id": 7, "cursor": f"/tickets/7/{kind}.json?page=2"}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, tool, arguments)
+    assert "Invalid or expired cursor" not in text
+    assert is_error is True and "404" in text
+
+
+def test_flow_export_later_page_error_is_not_a_cursor_error(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a resumed export, a 500 on a later page is not reported as an invalid cursor."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    pages = _export_stream(total=5000, latency=10.0)
+    fail_after = {"offset": None}
+
+    def answer(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Serve pages; once armed, fail every page after the first one of the call."""
+        after = request.url.params.get("page[after]")
+        if (
+            fail_after["offset"] is not None
+            and after
+            and _cursor_offset(after) > fail_after["offset"]
+        ):
+            return 1.0, httpx.Response(422, json={"error": "x"})
+        return pages(request)
+
+    _slow_zendesk(module, clock, answer)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        cursor = _cut_export_cursor(client)
+        fail_after["offset"] = 200
+        arguments = {"query": "x", "cursor": cursor}
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, "export_search_results", arguments)
+    assert "Invalid or expired cursor" not in text
+    assert is_error is True and "422" in text
+
+
+def test_audits_bad_cursor_is_refused_before_any_request(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A comments cursor sent to get_ticket_audits is refused with no request sent."""
+    module = _load_http(load_server)
+    seen = _stub_zendesk(module, monkeypatch)
+    arguments = {"ticket_id": 7, "cursor": "/tickets/7/comments.json?page=2"}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        is_error, text = _tool_text(client, CLAUDE_CODE_PATH, "get_ticket_audits", arguments)
+    assert is_error is False and "Invalid or expired cursor" in _json_object(text).get("error", "")
+    assert seen == []
+
+
+def test_overlong_cursor_is_refused(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A comments cursor over 2,048 characters is refused before any request."""
+    module = _load_http(load_server)
+    seen = _stub_zendesk(module, monkeypatch)
+    arguments = {"ticket_id": 7, "cursor": "/tickets/7/comments.json?page=" + "9" * 2100}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        _, text = _tool_text(client, CLAUDE_CODE_PATH, "get_ticket_comments", arguments)
+    assert "Invalid or expired cursor" in _json_object(text).get("error", "") and seen == []
+
+
+def test_call_deadline_fails_closed_without_request(load_server: Callable[..., ModuleType]) -> None:
+    """HTTP mode with no MCP request (e.g. a worker thread) refuses to guess a deadline."""
+    http = _load_http(load_server)
+    with pytest.raises(RuntimeError, match="Cannot tell which endpoint"):
+        http._call_deadline()
+    assert load_server(MCP_TRANSPORT=None)._call_deadline() is None
+
+
+def _big_threads(request: httpx.Request) -> tuple[float, httpx.Response]:
+    """Two 2 s pages per ticket; page 1 holds one comment of about 700 KB."""
+    if request.url.params.get("page") == "2":
+        return 2.0, httpx.Response(200, json={"comments": [{"id": 2}], "next_page": None})
+    next_page = f"https://example.zendesk.com{request.url.path}?page=2"
+    comment = {"id": 1, "body": "a" * 700_000}
+    return 2.0, httpx.Response(200, json={"comments": [comment], "next_page": next_page})
+
+
+def test_flow_bulk_oversized_keeps_warning(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Over ~4 MB with threads cut by the budget: a `warning`, and no `unfinished` cursors."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, _big_threads)
+    call = {"ticket_ids": list(range(1, 9)), "max_concurrency": 1}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, "get_comments_for_tickets", call)
+    body = _json_object(text)
+    assert is_error is False and "comment_counts" in body and "unfinished" not in body
+    assert "time budget" in body.get("warning", "")
+
+
+def test_flow_bulk_unresumable_ticket_goes_to_errors(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bulk thread the budget cuts at a page we cannot resume goes to `errors`, not results."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    calls = itertools.count()
+
+    def answer(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Page 1 (10 s) links to a page with a key we refuse; that page takes 20 s."""
+        first = next(calls) == 0
+        link = "https://example.zendesk.com/api/v2/tickets/7/comments.json?page=2&include=users"
+        body = {"comments": [{"id": 1 if first else 2}], "next_page": link if first else None}
+        return (10.0 if first else 20.0), httpx.Response(200, json=body)
+
+    _slow_zendesk(module, clock, answer)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        call = {"ticket_ids": [7]}
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, "get_comments_for_tickets", call)
+    body = _json_object(text)
+    assert "cannot be resumed" in body.get("errors", {}).get("7", "")
+    assert "7" not in body["comments_by_ticket"] and "unfinished" not in body
+
+
+def test_flow_export_missing_after_cursor_ends_chain_with_warning(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resumed export page with more results but no after_cursor ends the chain with a warning."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    pages = _export_stream(total=5000, latency=10.0)
+
+    def answer(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Serve pages; from offset 200 on, a page claims more but carries no after_cursor."""
+        latency, response = pages(request)
+        body = response.json()
+        after = request.url.params.get("page[after]")
+        if after and _cursor_offset(after) >= 200:
+            body["meta"]["after_cursor"] = None
+        return latency, httpx.Response(200, json=body)
+
+    _slow_zendesk(module, clock, answer)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        ids, bodies = _export_chain(client, {"query": "x"})
+    assert ids == list(range(1, 301))
+    assert len(bodies) == 2 and "next_cursor" in bodies[0]
+    assert "a missing cursor" in bodies[-1]["warning"] and "next_cursor" not in bodies[-1]
+
+
+# Round 2: guards on branches the work review found untested
+
+
+def test_flow_fetch_attachment_no_time_left_sends_nothing(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With under 1 s left after the token check, fetch_attachment opens no stream."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, _tags, token_check_seconds=24.5)
+    record: list[dict] = []
+    monkeypatch.setattr(module.httpx, "stream", _fake_attachment_stream(clock, record, [b"a"]))
+    attachment = {"url": "https://example.zendesk.com/a"}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, "fetch_attachment", attachment)
+    body = _json_object(text)
+    assert body.get("kind") == "stopped_by_time_budget" and body.get("bytes_read") == 0
+    assert record == []
+
+
+def _one_ticket_pages(request: httpx.Request) -> tuple[float, httpx.Response]:
+    """0.1 s export pages of one ticket each, always with more."""
+    page = {"results": [{"id": 1}], "meta": {"has_more": True, "after_cursor": "c"}}
+    return 0.1, httpx.Response(200, json=page)
+
+
+@pytest.mark.parametrize("path", [CLAUDE_CODE_PATH, "stdio"])
+def test_page_cap_gives_no_cursor_off_flow_path(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Off the flow, the 50-page cap ends the export with a warning and no next_cursor."""
+    module = load_server() if path == "stdio" else _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    sent = _slow_zendesk(module, clock, _one_ticket_pages)
+    if path == "stdio":
+        _, text = anyio.run(_call_in_memory_args, module, "export_search_results", {"query": "x"})
+    else:
+        with TestClient(module.app, base_url=BASE_URL) as client:
+            _, text = _tool_text(client, path, "export_search_results", {"query": "x"})
+    body = _json_object(text)
+    assert body["returned_count"] == 50 and "next_cursor" not in body
+    assert "request cap" in body.get("warning", "")
+    assert sent[0][1].url.params["page[size]"] == "1000"  # flow pages are 100
+
+
+@pytest.mark.parametrize("path", [ZENDESK_FLOW_PATH, "stdio"])
+@pytest.mark.parametrize(
+    "tool,arguments",
+    [
+        ("get_ticket_comments", {"ticket_id": 7}),
+        ("get_ticket_audits", {"ticket_id": 7}),
+        ("export_search_results", {"query": "x"}),
+    ],
+)
+def test_first_page_404_without_cursor_is_a_plain_error(
+    load_server: Callable[..., ModuleType],
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    tool: str,
+    arguments: dict,
+) -> None:
+    """Guard: a call from the start whose first page 404s raises as on main, not a cursor error."""
+    module = load_server() if path == "stdio" else _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, lambda request: (0.1, httpx.Response(404, json={})))
+    if path == "stdio":
+        is_error, text = anyio.run(_call_in_memory_args, module, tool, arguments)
+    else:
+        with TestClient(module.app, base_url=BASE_URL) as client:
+            is_error, text = _tool_text(client, path, tool, arguments)
+    assert "Invalid or expired cursor" not in text
+    assert is_error is True and "404" in text
+
+
+@pytest.mark.parametrize("status", [500, 429])
+@pytest.mark.parametrize(
+    "tool", ["get_ticket_comments", "get_ticket_audits", "export_search_results"]
+)
+def test_resumed_first_request_non_cursor_status_is_not_a_cursor_error(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, tool: str, status: int
+) -> None:
+    """A 500, or a 429 after the last retry, on a resumed call's first request is a plain error."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    headers = {"retry-after": "1"} if status == 429 else {}
+    sent = _slow_zendesk(
+        module, clock, lambda request: (0.1, httpx.Response(status, headers=headers, json={}))
+    )
+    if tool == "export_search_results":
+        arguments = {"query": "x", "cursor": module._export_cursor("x", 100, "abc")}
+    else:
+        kind = "comments" if tool == "get_ticket_comments" else "audits"
+        arguments = {"ticket_id": 7, "cursor": f"/tickets/7/{kind}.json?page=2"}
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, tool, arguments)
+    assert "Invalid or expired cursor" not in text
+    assert is_error is True and str(status) in text and sent
+
+
+@pytest.mark.parametrize(
+    "tool,arguments,level,method",
+    [
+        ("create_ticket", {"subject": "s", "body": "b"}, "management", "POST"),
+        ("add_ticket_tags", {"ticket_id": 1, "tags": ["x"]}, "management", "PUT"),
+        ("delete_ticket", {"ticket_id": 1}, "admin", "DELETE"),
+    ],
+)
+def test_flow_write_refused_with_under_5_s_left(
+    load_server: Callable[..., ModuleType],
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    arguments: dict,
+    level: str,
+    method: str,
+) -> None:
+    """POST, PUT and DELETE are all refused, unsent, when the token check leaves 4 s."""
+    module = _load_http(load_server, ACCESS_LEVEL=level)
+    clock = _with_clock(module, monkeypatch)
+
+    def ticket(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """Any request takes 1 s and returns a ticket."""
+        return 1.0, httpx.Response(200, json={"ticket": {"id": 1, "subject": "s", "tags": []}})
+
+    sent = _slow_zendesk(module, clock, ticket, token_check_seconds=21.0, scopes=["read", "write"])
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        is_error, text = _tool_text(client, ZENDESK_FLOW_PATH, tool, arguments)
+    assert method not in [request.method for _, request in sent]
+    assert is_error is True and "no change was made" in text
+
+
+def test_flow_retry_after_just_over_time_left_does_not_sleep(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boundary: a Retry-After that fits but leaves under 1 s for the retry is not slept."""
+    module = _load_http(load_server)
+    clock = _with_clock(module, monkeypatch)
+    pages = itertools.count(1)
+
+    def then_429(request: httpx.Request) -> tuple[float, httpx.Response]:
+        """First page at 10 s; then a 429 at 11.5 s asking for 13 s (13.5 s are left)."""
+        if next(pages) == 1:
+            return _export_page(request)
+        return 1.5, httpx.Response(429, headers={"retry-after": "13"})
+
+    _slow_zendesk(module, clock, then_429)
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        _, text = _tool_text(client, ZENDESK_FLOW_PATH, "export_search_results", {"query": "x"})
+    assert _json_object(text)["returned_count"] == 1
+    assert clock.sleeps == []
+
+
+def test_http_resumable_requires_cursor_parameter(load_server: Callable[..., ModuleType]) -> None:
+    """`_http_resumable` refuses a tool that has no `cursor` parameter."""
+    module = _load_http(load_server)
+
+    def no_cursor(ticket_id: int) -> str:
+        """A tool without `cursor`."""
+        return ""
+
+    with pytest.raises(RuntimeError, match="expected a `cursor` parameter"):
+        module._http_resumable("`x`")(no_cursor)
+
+
+def test_stdio_export_ticket_comments_writes_whole_thread(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Stdio export_ticket_comments still follows every page with no deadline."""
+    module = load_server()
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, _paged("comments", pages=3, latency=20.0))
+    output = tmp_path / "thread.json"
+    arguments = {"ticket_id": 7, "output_path": str(output)}
+    is_error, text = anyio.run(_call_in_memory_args, module, "export_ticket_comments", arguments)
+    assert is_error is False and _json_object(text)["comment_count"] == 6
+    assert _ids(json.loads(output.read_text())) == [11, 12, 21, 22, 31, 32]
