@@ -18,10 +18,18 @@ with the `read` scope; the server forwards that token to Zendesk and never uses 
 ZENDESK_API_KEY. Write tools also need the `write` scope; ACCESS_LEVEL stays the ceiling.
 MCP_PUBLIC_URL (`https://host[:port]`) is the public base URL; it is required when MCP_HOST is
 not a loopback address.
+
+Calls on /zendesk/mcp have a time budget (MCP_ZENDESK_FLOW_BUDGET_SECONDS, 1-29, default 25),
+counted from the request's arrival, because Zendesk stops each tool call after 30 s. Paged reads
+then return partial results with a `warning`, and some a `next_cursor` to resume from; single
+reads fail with an error; a write is never cut, but is refused with under 5 s left. Stdio and
+/claude/mcp have no budget.
 """
 
 import base64
 import enum
+import hashlib
+import inspect
 import json
 import math
 import mimetypes
@@ -34,7 +42,7 @@ from html.parser import HTMLParser
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
-from urllib.parse import unquote_plus, urlparse, urlsplit
+from urllib.parse import parse_qsl, unquote_plus, urlparse, urlsplit
 
 import httpx
 from dotenv import load_dotenv
@@ -93,8 +101,9 @@ class Endpoint(enum.Enum):
     CLAUDE_CODE = "claude_code"
 
 
-# ASGI scope key under which each HTTP route records its Endpoint.
+# ASGI scope keys under which each HTTP route records its Endpoint and when the request arrived.
 _ENDPOINT_SCOPE_KEY = "zendesk_mcp.endpoint"
+_REQUEST_START_SCOPE_KEY = "zendesk_mcp.request_start"
 _HTTP_ENDPOINTS = (Endpoint.ZENDESK_FLOW, Endpoint.CLAUDE_CODE)
 
 
@@ -249,11 +258,34 @@ def _http_settings() -> dict[str, Any]:
     }
 
 
+def _flow_budget_seconds() -> float:
+    """Read MCP_ZENDESK_FLOW_BUDGET_SECONDS, the time budget for calls on /zendesk/mcp.
+
+    Returns:
+        The budget in seconds; 25 when unset.
+
+    Raises:
+        ValueError: The value is not a number from 1 to 29.
+    """
+    raw = os.environ.get("MCP_ZENDESK_FLOW_BUDGET_SECONDS", "25")
+    try:
+        budget = float(raw)
+    except ValueError:
+        budget = math.nan
+    if not 1 <= budget <= 29:
+        raise ValueError(
+            f"Invalid MCP_ZENDESK_FLOW_BUDGET_SECONDS: {raw!r}. Must be a number from 1 to 29."
+        )
+    return budget
+
+
 if TRANSPORT == "stdio":
     mcp = FastMCP("zendesk")
+    ZENDESK_FLOW_BUDGET_SECONDS: float | None = None
 else:
     _http_config = _http_settings()
     RESOURCE_BASE_URL: str = _http_config.pop("resource_base_url")
+    ZENDESK_FLOW_BUDGET_SECONDS = _flow_budget_seconds()
     mcp = FastMCP(
         "zendesk",
         stateless_http=True,
@@ -289,6 +321,193 @@ def _current_endpoint() -> Endpoint:
     if endpoint not in _HTTP_ENDPOINTS:
         raise RuntimeError("Cannot tell which endpoint this tool call came from; refusing it.")
     return endpoint
+
+
+class _DeadlineReached(Exception):
+    """A call on /zendesk/mcp ran out of its time budget.
+
+    No further request was sent: the next one would not fit in the time left, a Retry-After
+    wait would not fit, or the last request timed out under its capped timeout.
+
+    Attributes:
+        partial: Results gathered before the stop, when the raiser had any.
+        next_cursor: Where to resume (see `_page_cursor`), when the raiser can resume; None
+            when the next page cannot be resumed through this server.
+        progressed: False when no page arrived before the stop.
+    """
+
+    def __init__(
+        self,
+        partial: list | None = None,
+        next_cursor: str | None = None,
+        detail: str = "",
+        progressed: bool = True,
+    ) -> None:
+        message = (
+            f"Stopped by the {ZENDESK_FLOW_BUDGET_SECONDS:g} s time budget for Zendesk action "
+            "flows (/zendesk/mcp)."
+        )
+        super().__init__(f"{message} {detail}" if detail else message)
+        self.progressed = progressed
+        self.partial = partial
+        self.next_cursor = next_cursor
+
+
+# Query keys Zendesk puts in a ticket comments/audits `next_page` link; a cursor may carry only these.
+_CURSOR_QUERY_KEYS = frozenset({"page", "per_page", "page[size]", "page[after]", "sort_order"})
+# No `next_cursor` here, so a flow that loops on it cannot spin without progress.
+_NO_PROGRESS_ERROR = "Zendesk did not answer in time; nothing was fetched. Try again later."
+_NO_PROGRESS_WITH_CURSOR_ERROR = (
+    "Zendesk did not answer in time; nothing was fetched. Retry with the same `cursor`."
+)
+_CURSOR_NOT_RESUMABLE = (
+    "Zendesk's next-page link cannot be resumed through this server, so no `next_cursor` is "
+    "given; call again without `cursor` to start over."
+)
+
+
+def _no_progress_error(stop: "_DeadlineReached", cursor: str | None) -> str:
+    """Build the error for a call the budget stopped before any page arrived.
+
+    It has no `next_cursor`, so a flow that loops on `next_cursor` stops.
+
+    Args:
+        stop: The deadline exception.
+        cursor: The caller's cursor, if the call was a resume.
+
+    Returns:
+        JSON with an `error`.
+    """
+    hint = _NO_PROGRESS_ERROR if cursor is None else _NO_PROGRESS_WITH_CURSOR_ERROR
+    return json.dumps({"error": f"{stop} {hint}"}, indent=2)
+
+
+def _cut_short(key: str, items: list, stop: "_DeadlineReached", next_cursor: str | None) -> str:
+    """Build a comments or audits answer that the time budget cut short.
+
+    Args:
+        key: "comments" or "audits".
+        items: What was fetched before the stop.
+        stop: The deadline exception.
+        next_cursor: Where to resume, or None when the next page cannot be resumed.
+
+    Returns:
+        JSON with the items, a `warning`, and `next_cursor` when there is one.
+    """
+    if next_cursor is None:
+        out = {key: items, "warning": f"Incomplete. {stop} {_CURSOR_NOT_RESUMABLE}"}
+    else:
+        out = {
+            key: items,
+            "warning": f"Incomplete. {stop} Call again with `cursor` = `next_cursor`.",
+            "next_cursor": next_cursor,
+        }
+    return json.dumps(out, indent=2)
+
+
+_CURSOR_MAX_LENGTH = 2048
+_CURSOR_REJECTION_STATUSES = (400, 404, 422)
+_INVALID_CURSOR_ERROR = "Invalid or expired cursor; call again without `cursor` to start over."
+
+
+def _page_cursor(url: str) -> str:
+    """Turn the URL of the next page to fetch into an opaque resume cursor.
+
+    Args:
+        url: An absolute Zendesk `next_page` link, or a path relative to the API base.
+
+    Returns:
+        The path below `/api/v2` plus its query, e.g. `/tickets/1/comments.json?page=3`.
+    """
+    parts = urlsplit(url)
+    path = parts.path.removeprefix("/api/v2")
+    return f"{path}?{parts.query}" if parts.query else path
+
+
+def _cursor_url(cursor: str, expected_path: str) -> str | None:
+    """Check a caller's cursor before it is sent to Zendesk with the caller's credentials.
+
+    Args:
+        cursor: The `cursor` argument, as a previous call's `next_cursor` returned it.
+        expected_path: The only path this tool may resume, e.g. `/tickets/1/comments.json`.
+
+    Returns:
+        The cursor, which is a path relative to the API base, or None when it is not one this
+        tool issued: it is over _CURSOR_MAX_LENGTH characters, or has a scheme, host, fragment,
+        `;`, whitespace or control character, another path, a repeated query key, or a query
+        key outside `_CURSOR_QUERY_KEYS`.
+    """
+    if len(cursor) > _CURSOR_MAX_LENGTH or ";" in cursor:
+        return None
+    if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in cursor):
+        return None
+    parts = urlsplit(cursor)
+    if parts.scheme or parts.netloc or parts.fragment or parts.path != expected_path:
+        return None
+    keys = [key for key, _ in parse_qsl(parts.query, keep_blank_values=True)]
+    if len(keys) != len(set(keys)) or not set(keys) <= _CURSOR_QUERY_KEYS:
+        return None
+    return cursor
+
+
+def _is_cursor_rejection(
+    error: httpx.HTTPStatusError, cursor: str | None, first_request: bool
+) -> bool:
+    """Tell whether a Zendesk error means the caller's cursor was rejected or has expired.
+
+    Only the first request of a resumed call uses the caller's cursor; an error on a later
+    page is an ordinary error and is raised as before.
+
+    Args:
+        error: The HTTP error from Zendesk.
+        cursor: The caller's cursor, or None for a call from the start.
+        first_request: Whether the failing request was the first of this call.
+
+    Returns:
+        True for a 400, 404 or 422 on the first request of a resumed call.
+    """
+    status = error.response.status_code
+    return cursor is not None and first_request and status in _CURSOR_REJECTION_STATUSES
+
+
+def _invalid_cursor() -> str:
+    """Return the JSON error for a cursor that is malformed, foreign or expired."""
+    return json.dumps({"error": _INVALID_CURSOR_ERROR}, indent=2)
+
+
+def _checked_page_cursor(url: str, expected_path: str) -> str | None:
+    """Turn a next-page URL into a cursor, but only one `_cursor_url` would accept back.
+
+    Args:
+        url: The page not yet fetched.
+        expected_path: The path the cursor must keep.
+
+    Returns:
+        The cursor, or None, so the server never hands out a cursor it would refuse.
+    """
+    cursor = _page_cursor(url)
+    return cursor if _cursor_url(cursor, expected_path) is not None else None
+
+
+def _call_deadline() -> float | None:
+    """Return the monotonic time by which the current tool call must stop, or None for no limit.
+
+    Only calls on /zendesk/mcp have a deadline: the route's arrival time plus
+    ZENDESK_FLOW_BUDGET_SECONDS, so the token check counts against it. Call it in the tool's own
+    thread and pass the value to worker threads, like the caller's auth.
+
+    Returns:
+        None in stdio mode and on /claude/mcp; otherwise the deadline.
+
+    Raises:
+        RuntimeError: HTTP mode, and the endpoint cannot be resolved (see `_current_endpoint`).
+    """
+    if TRANSPORT == "stdio":
+        return None
+    if _current_endpoint() is not Endpoint.ZENDESK_FLOW:
+        return None
+    request = mcp.get_context().request_context.request
+    return request.scope[_REQUEST_START_SCOPE_KEY] + ZENDESK_FLOW_BUDGET_SECONDS
 
 
 def _stdio_only_tool() -> Callable[[ToolFunction], ToolFunction]:
@@ -371,6 +590,135 @@ def _http_doc_needs_write_scope() -> Callable[[ToolFunction], ToolFunction]:
             doc,
             count=1,
         )
+        return fn
+
+    return decorate
+
+
+def _doc_indent(doc: str) -> str:
+    """Return the indentation of a docstring's body lines.
+
+    Args:
+        doc: The docstring.
+
+    Returns:
+        The shortest leading whitespace of the non-blank lines after the first; "" for a
+        one-line docstring.
+    """
+    body = [line for line in doc.split("\n")[1:] if line.strip()]
+    indents = [re.match(r"[ \t]*", line).group() for line in body]
+    return min(indents, key=len, default="")
+
+
+def _http_doc_time_budget(
+    result: str = "returns what it has, with a `warning`",
+) -> Callable[[ToolFunction], ToolFunction]:
+    """Append the /zendesk/mcp time-budget note to a tool docstring in HTTP mode.
+
+    Args:
+        result: What the tool returns when the budget stops it.
+
+    Returns:
+        A decorator that rewrites `fn.__doc__` in HTTP mode and is a no-op in stdio mode.
+    """
+
+    def decorate(fn: ToolFunction) -> ToolFunction:
+        if TRANSPORT == "stdio":
+            return fn
+        doc = fn.__doc__ or ""
+        fn.__doc__ = doc.rstrip() + (
+            f"\n\n{_doc_indent(doc)}On /zendesk/mcp (Zendesk action flows) the call stops after "
+            f"{ZENDESK_FLOW_BUDGET_SECONDS:g} s and {result}."
+        )
+        return fn
+
+    return decorate
+
+
+_RESUME_CURSOR_ARG = (
+    "cursor: HTTP only. The `next_cursor` from a previous call that the time budget cut "
+    "short; omit it to start from the beginning."
+)
+_COMMENTS_CURSOR_ARG = (
+    "cursor: HTTP only. The `next_cursor` from a previous call that the time budget cut "
+    "short, or a value from get_comments_for_tickets' `unfinished`; omit it to start from the "
+    "beginning."
+)
+
+
+def _add_doc_arg(doc: str, arg_line: str) -> str:
+    """Add one argument line at the end of a docstring's `Args:` section, creating it if absent.
+
+    Args:
+        doc: The docstring.
+        arg_line: The line to add, e.g. "cursor: ...", without indentation.
+
+    Returns:
+        The docstring with the line added, indented like the section's other arguments.
+    """
+    lines = doc.rstrip().split("\n")
+    args_index = next((i for i, line in enumerate(lines) if line.strip() == "Args:"), None)
+    if args_index is None:
+        indent = re.match(r"[ \t]*", lines[-1]).group() if len(lines) > 1 else ""
+        return "\n".join([*lines, "", f"{indent}Args:", f"{indent}    {arg_line}"])
+    indent = re.match(r"[ \t]*", lines[args_index]).group()
+    end = args_index + 1
+    while (
+        end < len(lines)
+        and lines[end].strip()
+        and len(lines[end]) - len(lines[end].lstrip()) > len(indent)
+    ):
+        end += 1
+    lines.insert(end, f"{indent}    {arg_line}")
+    return "\n".join(lines)
+
+
+def _http_resumable(
+    shape: str, arg_lines: tuple[str, ...] = (_RESUME_CURSOR_ARG,), also_stops: str = ""
+) -> Callable[[ToolFunction], ToolFunction]:
+    """Offer the `cursor` parameter in HTTP mode only, and document resuming there.
+
+    In stdio mode the tool's signature is presented without `cursor`, so its input schema
+    and description stay exactly as before; the parameter then always takes its default, None.
+    In HTTP mode `cursor` is added to the `Args:` section and a resume note is appended.
+
+    Args:
+        shape: The keys of the cut-short response, e.g. "`comments`, `warning` and
+            `next_cursor`".
+        arg_lines: Lines for the `Args:` section, the `cursor:` line included. A tool whose
+            docstring has no `Args:` section passes a line for every argument.
+        also_stops: Another stop that also returns a cursor there, e.g. " or at the 50-page
+            cap"; empty when the time budget is the only one.
+
+    Returns:
+        A decorator for a tool whose last parameter is `cursor: str | None = None`.
+
+    Raises:
+        RuntimeError: The tool has no `cursor` parameter.
+    """
+
+    def decorate(fn: ToolFunction) -> ToolFunction:
+        signature = inspect.signature(fn)
+        if "cursor" not in signature.parameters:
+            raise RuntimeError(f"{fn.__name__}: expected a `cursor` parameter")
+        if TRANSPORT == "stdio":
+            kept = [param for name, param in signature.parameters.items() if name != "cursor"]
+            fn.__signature__ = signature.replace(parameters=kept)
+            return fn
+        note = (
+            f"On /zendesk/mcp (Zendesk action flows) the call stops after "
+            f"{ZENDESK_FLOW_BUDGET_SECONDS:g} s{also_stops} and returns {shape} with what it "
+            "has so far. A call that is not cut short returns the usual result. "
+            "While a response has `next_cursor`, call again with `cursor` set to it. If an "
+            "`error` says to retry with the same `cursor`, call again with that same `cursor`. "
+            "Any other response without `next_cursor` ends the chain; if it has a `warning` or "
+            "an `error`, the result is incomplete."
+        )
+        doc = fn.__doc__ or ""
+        indent = _doc_indent(doc)
+        for arg_line in arg_lines:
+            doc = _add_doc_arg(doc, arg_line)
+        fn.__doc__ = doc.rstrip() + "\n\n" + indent + note
         return fn
 
     return decorate
@@ -479,9 +827,62 @@ def _zendesk_auth() -> ZendeskAuth:
     return _BearerAuth(_caller_access_token().token)
 
 
+_CLIENT_TIMEOUT_SECONDS = 30.0
+_DEADLINE_MIN_REQUEST_SECONDS = 1.0
+_DEADLINE_MIN_WRITE_SECONDS = 5.0
+
+
+def _send_get(
+    path: str, params: dict | None, auth: ZendeskAuth, deadline: float | None
+) -> httpx.Response:
+    """Send one GET through the shared client, each timeout phase capped at the time left.
+
+    Args:
+        path: API path relative to the base URL, or an absolute `next_page` URL.
+        params: Query parameters, if any.
+        auth: Credentials to send.
+        deadline: From `_call_deadline()`; None sends exactly as before, with the client timeout.
+
+    Returns:
+        The response.
+
+    Raises:
+        _DeadlineReached: Less than _DEADLINE_MIN_REQUEST_SECONDS are left (nothing is sent), or
+            the request timed out under the capped timeout.
+    """
+    if deadline is None:
+        return _client.get(path, params=params, auth=auth)
+    remaining = deadline - time.monotonic()
+    if remaining < _DEADLINE_MIN_REQUEST_SECONDS:
+        raise _DeadlineReached()
+    timeout = min(_CLIENT_TIMEOUT_SECONDS, remaining)
+    try:
+        return _client.get(path, params=params, auth=auth, timeout=timeout)
+    except httpx.TimeoutException as error:
+        raise _DeadlineReached() from error
+
+
+def _check_time_for_write() -> None:
+    """Refuse to start a write on /zendesk/mcp when too little of the budget is left.
+
+    A write that has been sent is never cut short: its timeout stays the client default, so a
+    change Zendesk applied is never reported as failed by this server.
+
+    Raises:
+        _DeadlineReached: Less than _DEADLINE_MIN_WRITE_SECONDS are left; nothing was sent.
+    """
+    deadline = _call_deadline()
+    if deadline is not None and deadline - time.monotonic() < _DEADLINE_MIN_WRITE_SECONDS:
+        raise _DeadlineReached(detail="Nothing was sent to Zendesk; no change was made.")
+
+
 def _get(path: str, params: dict | None = None) -> dict:
-    """Make a GET request to Zendesk API. Raises on HTTP errors."""
-    resp = _client.get(path, params=params, auth=_zendesk_auth())
+    """Make a GET request to Zendesk API. Raises on HTTP errors.
+
+    Resolves the caller's auth and deadline itself, so call it in the tool's own thread.
+    Raises _DeadlineReached when the /zendesk/mcp time budget runs out.
+    """
+    resp = _send_get(path, params, _zendesk_auth(), _call_deadline())
     resp.raise_for_status()
     return resp.json()
 
@@ -491,7 +892,11 @@ _RETRY_MAX_BACKOFF_SECONDS = 30
 
 
 def _get_with_retry(
-    path: str, params: dict | None = None, *, auth: ZendeskAuth | None = None
+    path: str,
+    params: dict | None = None,
+    *,
+    deadline: float | None,
+    auth: ZendeskAuth | None = None,
 ) -> dict:
     """GET with capped 429 backoff. Honors Zendesk's Retry-After header.
 
@@ -502,6 +907,8 @@ def _get_with_retry(
     Args:
         path: API path relative to the base URL, or an absolute `next_page` URL.
         params: Query parameters, if any.
+        deadline: From `_call_deadline()`, resolved in the tool's thread; None for no limit.
+            A Retry-After wait that would not leave _DEADLINE_MIN_REQUEST_SECONDS stops at once.
         auth: Credentials to send. Worker threads must pass the caller's credentials,
             resolved in the calling thread; None resolves them here with `_zendesk_auth()`.
 
@@ -511,18 +918,23 @@ def _get_with_retry(
     Raises:
         httpx.HTTPStatusError: The final attempt returned an error status (including a 429 after
             the last retry).
+        _DeadlineReached: The deadline left no time for the next request or wait.
     """
     request_auth = _zendesk_auth() if auth is None else auth
     data: dict = {}
     for attempt in range(_RETRY_MAX_ATTEMPTS):
-        resp = _client.get(path, params=params, auth=request_auth)
+        resp = _send_get(path, params, request_auth, deadline)
         if resp.status_code == 429 and attempt < _RETRY_MAX_ATTEMPTS - 1:
             retry_after = resp.headers.get("retry-after", "5")
             try:
                 wait = int(retry_after)
             except ValueError:
                 wait = 5
-            time.sleep(min(max(wait, 1), _RETRY_MAX_BACKOFF_SECONDS))
+            wait = min(max(wait, 1), _RETRY_MAX_BACKOFF_SECONDS)
+            time_left = math.inf if deadline is None else deadline - time.monotonic()
+            if time_left < wait + _DEADLINE_MIN_REQUEST_SECONDS:
+                raise _DeadlineReached()
+            time.sleep(wait)
             continue
         resp.raise_for_status()
         data = resp.json()
@@ -532,6 +944,7 @@ def _get_with_retry(
 
 def _post(path: str, json_body: dict) -> dict:
     """Make a POST request to Zendesk API. Raises on HTTP errors."""
+    _check_time_for_write()
     resp = _client.post(path, json=json_body, auth=_zendesk_auth())
     resp.raise_for_status()
     return resp.json()
@@ -565,6 +978,7 @@ def _post_upload(filename: str, content: bytes, content_type: str) -> dict:
 
 def _put(path: str, json_body: dict) -> dict:
     """Make a PUT request to Zendesk API. Raises on HTTP errors."""
+    _check_time_for_write()
     resp = _client.put(path, json=json_body, auth=_zendesk_auth())
     resp.raise_for_status()
     return resp.json()
@@ -572,6 +986,7 @@ def _put(path: str, json_body: dict) -> dict:
 
 def _delete(path: str) -> str:
     """Make a DELETE request to Zendesk API. Raises on HTTP errors."""
+    _check_time_for_write()
     resp = _client.delete(path, auth=_zendesk_auth())
     resp.raise_for_status()
     return "Deleted successfully."
@@ -827,8 +1242,65 @@ _EXPORT_MAX_RESULTS = 10000
 _EXPORT_MAX_PAGES = 50
 
 
+_EXPORT_CURSOR_ARG = (
+    "cursor: HTTP only. The `next_cursor` from a previous call that the time budget or the "
+    "50-page cap cut short; pass the same `query`. When set, `max_results` is ignored: the "
+    "cursor carries what is left of the first call's `max_results`."
+)
+# Zendesk recommends 100 per export page; 1,000 "may" slow down or time out. Used on
+# /zendesk/mcp only, where one page must fit in the time budget.
+_EXPORT_FLOW_PAGE_SIZE = 100
+_EXPORT_CURSOR_PATTERN = re.compile(
+    r"v1\.([0-9a-f]{16})\.([1-9][0-9]{0,4})\.([A-Za-z0-9+/=_-]{1,1024})"
+)
+
+
+def _query_fingerprint(query: str) -> str:
+    """Return a short digest that ties an export cursor to its query."""
+    return hashlib.sha256(query.encode()).hexdigest()[:16]
+
+
+def _export_cursor(query: str, remaining: int, after_cursor: str) -> str:
+    """Wrap Zendesk's `after_cursor` into an opaque resume cursor for export_search_results.
+
+    Args:
+        query: The search query the cursor belongs to.
+        remaining: How many tickets the caller's `max_results` still allows.
+        after_cursor: Zendesk's cursor for the next page.
+
+    Returns:
+        `v1.<query digest>.<remaining>.<after_cursor>`.
+    """
+    return f"v1.{_query_fingerprint(query)}.{remaining}.{after_cursor}"
+
+
+def _parse_export_cursor(cursor: str, query: str) -> tuple[int, str] | None:
+    """Check an export cursor before it is sent to Zendesk.
+
+    Args:
+        cursor: The caller's `cursor` argument.
+        query: The caller's query; it must be the query the cursor was issued for.
+
+    Returns:
+        The remaining ticket allowance and Zendesk's `after_cursor`, or None when the cursor is
+        malformed, issued for another query, or allows more than _EXPORT_MAX_RESULTS.
+    """
+    match = _EXPORT_CURSOR_PATTERN.fullmatch(cursor)
+    if match is None or match.group(1) != _query_fingerprint(query):
+        return None
+    remaining = int(match.group(2))
+    if remaining > _EXPORT_MAX_RESULTS:
+        return None
+    return remaining, match.group(3)
+
+
 @mcp.tool()
-def export_search_results(query: str, max_results: int = 1000) -> str:
+@_http_resumable(
+    "`returned_count`, `tickets`, `warning` and `next_cursor`",
+    (_EXPORT_CURSOR_ARG,),
+    also_stops=f" or at the {_EXPORT_MAX_PAGES}-page cap",
+)
+def export_search_results(query: str, max_results: int = 1000, cursor: str | None = None) -> str:
     """Export the full set of tickets matching a search query.
 
     Unlike `search_tickets` (a single page of at most 100 tickets, and the
@@ -851,31 +1323,105 @@ def export_search_results(query: str, max_results: int = 1000) -> str:
 
     See https://support.zendesk.com/hc/en-us/articles/203663226 for query syntax.
     """
-    limit = max(1, min(max_results, _EXPORT_MAX_RESULTS))
+    start = _export_start(query, max_results, cursor)
+    if start is None:
+        return _invalid_cursor()
+    limit, params = start
+    deadline = _call_deadline()
+    page_size = _EXPORT_PAGE_SIZE if deadline is None else _EXPORT_FLOW_PAGE_SIZE
     tickets: list[dict] = []
-    truncated_by: str | None = None
-    params: dict = {"query": query, "filter[type]": "ticket"}
     pages = 0
     while True:
-        params["page[size]"] = min(_EXPORT_PAGE_SIZE, limit - len(tickets))
-        data = _get_with_retry("/search/export.json", params=params)
+        params["page[size]"] = min(page_size, limit - len(tickets))
+        try:
+            data = _get_with_retry("/search/export.json", params=params, deadline=deadline)
+        except _DeadlineReached as stop:
+            if pages == 0:
+                return _no_progress_error(stop, cursor)
+            return _export_stopped(query, tickets, limit, params["page[after]"], str(stop))
+        except httpx.HTTPStatusError as error:
+            if not _is_cursor_rejection(error, cursor, first_request=pages == 0):
+                raise
+            return _invalid_cursor()
         pages += 1
         tickets.extend(_project_ticket(t) for t in data.get("results", []))
         meta = data.get("meta", {})
-        if not meta.get("has_more"):
-            break
-        if len(tickets) >= limit:
-            truncated_by = f"max_results ({limit})"
-            break
-        if not meta.get("after_cursor"):
-            truncated_by = "a missing cursor in the Zendesk response"
-            break
-        if pages >= _EXPORT_MAX_PAGES:
-            truncated_by = f"the request cap ({_EXPORT_MAX_PAGES} pages)"
-            break
-        params["page[after]"] = meta["after_cursor"]
+        truncated_by = _export_stop_reason(meta, len(tickets), limit, pages, cursor)
+        if truncated_by is None:
+            params["page[after]"] = meta["after_cursor"]
+            continue
+        if truncated_by == _EXPORT_PAGE_CAP and deadline is not None:
+            # Small flow pages: let the flow resume past the cap; each call stays bounded.
+            reason = f"Stopped by {_EXPORT_PAGE_CAP}."
+            return _export_stopped(query, tickets, limit, meta["after_cursor"], reason)
+        return _export_result(tickets, limit, truncated_by, cursor)
 
-    if not tickets and not truncated_by:
+
+_EXPORT_PAGE_CAP = f"the request cap ({_EXPORT_MAX_PAGES} pages)"
+
+
+def _export_start(query: str, max_results: int, cursor: str | None) -> tuple[int, dict] | None:
+    """Work out an export call's ticket allowance and first request parameters.
+
+    Args:
+        query: The search query.
+        max_results: The caller's `max_results`; ignored when `cursor` is set.
+        cursor: The caller's cursor, or None to start from the beginning.
+
+    Returns:
+        The allowance and the parameters, or None when the cursor fails `_parse_export_cursor`.
+    """
+    params: dict = {"query": query, "filter[type]": "ticket"}
+    if cursor is None:
+        return max(1, min(max_results, _EXPORT_MAX_RESULTS)), params
+    parsed = _parse_export_cursor(cursor, query)
+    if parsed is None:
+        return None
+    limit, params["page[after]"] = parsed
+    return limit, params
+
+
+def _export_stop_reason(
+    meta: dict, ticket_count: int, limit: int, pages: int, cursor: str | None
+) -> str | None:
+    """Decide whether an export call goes on after a page, and if not, why it stops.
+
+    Args:
+        meta: The page's `meta` from Zendesk.
+        ticket_count: Tickets gathered so far in this call.
+        limit: The call's ticket allowance.
+        pages: Pages fetched so far in this call.
+        cursor: The caller's cursor, if this call is a resume.
+
+    Returns:
+        None to fetch the next page; "" when the result set is complete; otherwise the reason
+        the call stops short, as used in the `warning`.
+    """
+    if not meta.get("has_more"):
+        return ""
+    if ticket_count >= limit:
+        return f"max_results ({limit})" if cursor is None else "the max_results limit"
+    if not meta.get("after_cursor"):
+        return "a missing cursor in the Zendesk response"
+    if pages >= _EXPORT_MAX_PAGES:
+        return _EXPORT_PAGE_CAP
+    return None
+
+
+def _export_result(tickets: list[dict], limit: int, truncated_by: str, cursor: str | None) -> str:
+    """Build export_search_results' answer when the call ends without a resume cursor.
+
+    Args:
+        tickets: Tickets gathered in this call.
+        limit: The call's ticket allowance.
+        truncated_by: Why the call stopped short, or "" when the result set is complete.
+        cursor: The caller's cursor, if this call is a resume.
+
+    Returns:
+        "No tickets found." for an empty first call; otherwise JSON with the tickets and, when
+        cut short, a `warning`. A resumed call always answers JSON, even when empty.
+    """
+    if not tickets and not truncated_by and cursor is None:
         return "No tickets found."
     out: dict = {"returned_count": min(len(tickets), limit), "tickets": tickets[:limit]}
     if truncated_by:
@@ -883,6 +1429,38 @@ def export_search_results(query: str, max_results: int = 1000) -> str:
             f"Result set incomplete — stopped by {truncated_by}; more tickets match. "
             "Raise max_results or narrow the query."
         )
+    return json.dumps(out, indent=2)
+
+
+def _export_stopped(
+    query: str, tickets: list[dict], limit: int, after_cursor: str, reason: str
+) -> str:
+    """Build export_search_results' resumable answer on /zendesk/mcp.
+
+    Used when the time budget, or the page cap with flow-sized pages, stops a call after at
+    least one page.
+
+    Args:
+        query: The search query.
+        tickets: Tickets gathered in this call.
+        limit: The ticket allowance for this call.
+        after_cursor: Zendesk's cursor for the page that was not fetched.
+        reason: Why the call stopped.
+
+    Returns:
+        JSON with the tickets so far and a `warning`, plus a `next_cursor` carrying the rest of
+        the allowance when the cursor passes `_parse_export_cursor`.
+    """
+    out: dict = {"returned_count": len(tickets), "tickets": tickets}
+    next_cursor = _export_cursor(query, limit - len(tickets), after_cursor)
+    if _parse_export_cursor(next_cursor, query) is None:
+        out["warning"] = f"Result set incomplete. {reason} {_CURSOR_NOT_RESUMABLE}"
+        return json.dumps(out, indent=2)
+    out["warning"] = (
+        f"Result set incomplete. {reason} Call again with the same query and "
+        "`cursor` = `next_cursor`."
+    )
+    out["next_cursor"] = next_cursor
     return json.dumps(out, indent=2)
 
 
@@ -912,7 +1490,8 @@ def get_ticket(ticket_id: int) -> str:
 
 @mcp.tool()
 @_http_doc_remove("; use `export_ticket_comments` to write those to a local file.", ".")
-def get_ticket_comments(ticket_id: int) -> str:
+@_http_resumable("`comments`, `warning` and `next_cursor`", (_COMMENTS_CURSOR_ARG,))
+def get_ticket_comments(ticket_id: int, cursor: str | None = None) -> str:
     """Get all comments (replies) on a Zendesk ticket, in chronological order.
 
     Follows Zendesk's `next_page` pagination so long threads (>100 comments)
@@ -931,10 +1510,26 @@ def get_ticket_comments(ticket_id: int) -> str:
     Args:
         ticket_id: The Zendesk ticket ID.
     """
+    start_url = None
+    if cursor is not None:
+        start_url = _cursor_url(cursor, f"/tickets/{ticket_id}/comments.json")
+        if start_url is None:
+            return _invalid_cursor()
     try:
-        comments = _fetch_comments(ticket_id, max_bytes=_COMMENTS_INLINE_MAX_BYTES)
+        comments = _fetch_comments(
+            ticket_id,
+            max_bytes=_COMMENTS_INLINE_MAX_BYTES,
+            deadline=_call_deadline(),
+            start_url=start_url,
+        )
     except _CommentThreadTooLarge as exc:
         return json.dumps(exc.to_error(), indent=2)
+    except _DeadlineReached as stop:
+        if not stop.progressed:
+            return _no_progress_error(stop, cursor)
+        return _cut_short("comments", stop.partial, stop, stop.next_cursor)
+    except _CursorRejected:
+        return _invalid_cursor()
     return json.dumps(comments, indent=2)
 
 
@@ -959,7 +1554,7 @@ def export_ticket_comments(ticket_id: int, output_path: str) -> str:
     path = Path(output_path).expanduser()
     if not path.is_absolute():
         return json.dumps({"error": "output_path must be an absolute path."})
-    comments = _fetch_comments(ticket_id, max_bytes=None)
+    comments = _fetch_comments(ticket_id, max_bytes=None, deadline=None)  # stdio only
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(comments))
     result = {"path": str(path), "comment_count": len(comments), "bytes": path.stat().st_size}
@@ -1048,7 +1643,12 @@ def list_views() -> str:
 
 
 @mcp.tool()
-def get_ticket_audits(ticket_id: int) -> str:
+# Main's docstring has no `Args:` section, so the HTTP-only one lists `ticket_id` too.
+@_http_resumable(
+    "`audits`, `warning` and `next_cursor`",
+    ("ticket_id: The Zendesk ticket ID.", _RESUME_CURSOR_ARG),
+)
+def get_ticket_audits(ticket_id: int, cursor: str | None = None) -> str:
     """Get the audit log for a ticket — field changes, notifications, etc.
 
     Follows Zendesk's `next_page` pagination so busy tickets return their
@@ -1060,52 +1660,83 @@ def get_ticket_audits(ticket_id: int) -> str:
     `{"type": etype}` stubs so callers can see something happened without
     having to refetch the raw audits endpoint.
     """
+    audits_path = f"/tickets/{ticket_id}/audits.json"
+    url = audits_path if cursor is None else _cursor_url(cursor, audits_path)
+    if url is None:
+        return _invalid_cursor()
+    first_url = url
     audits: list = []
-    url: str | None = f"/tickets/{ticket_id}/audits.json"
     while url:
-        data = _get(url)
-        for a in data.get("audits", []):
-            events = []
-            for e in a.get("events", []):
-                etype = e.get("type")
-                if etype == "Change":
-                    events.append(
-                        {
-                            "type": "Change",
-                            "field": e.get("field_name"),
-                            "previous_value": e.get("previous_value"),
-                            "value": e.get("value"),
-                        }
-                    )
-                elif etype == "Notification":
-                    events.append(
-                        {
-                            "type": "Notification",
-                            "recipients": e.get("recipients", []),
-                            "subject": e.get("subject", ""),
-                        }
-                    )
-                elif etype in ("Comment", "VoiceComment"):
-                    continue
-                elif etype:
-                    events.append({"type": etype})
-            if events:
-                audits.append(
-                    {
-                        "id": a["id"],
-                        "author_id": a.get("author_id"),
-                        "created_at": a.get("created_at", ""),
-                        "events": events,
-                    }
-                )
+        try:
+            data = _get(url)
+        except _DeadlineReached as stop:
+            if url == first_url:
+                return _no_progress_error(stop, cursor)
+            return _cut_short("audits", audits, stop, _checked_page_cursor(url, audits_path))
+        except httpx.HTTPStatusError as error:
+            if not _is_cursor_rejection(error, cursor, first_request=url == first_url):
+                raise
+            return _invalid_cursor()
+        audits.extend(_project_audits(data))
         url = data.get("next_page")
     return json.dumps(audits, indent=2)
+
+
+def _project_audits(data: dict) -> list[dict]:
+    """Project one page of ticket audits for get_ticket_audits.
+
+    Args:
+        data: A Zendesk audits page.
+
+    Returns:
+        The page's audits that have events left after skipping comments, each projected.
+    """
+    audits: list[dict] = []
+    for a in data.get("audits", []):
+        events = []
+        for e in a.get("events", []):
+            etype = e.get("type")
+            if etype == "Change":
+                events.append(
+                    {
+                        "type": "Change",
+                        "field": e.get("field_name"),
+                        "previous_value": e.get("previous_value"),
+                        "value": e.get("value"),
+                    }
+                )
+            elif etype == "Notification":
+                events.append(
+                    {
+                        "type": "Notification",
+                        "recipients": e.get("recipients", []),
+                        "subject": e.get("subject", ""),
+                    }
+                )
+            elif etype in ("Comment", "VoiceComment"):
+                continue
+            elif etype:
+                events.append({"type": etype})
+        if events:
+            audits.append(
+                {
+                    "id": a["id"],
+                    "author_id": a.get("author_id"),
+                    "created_at": a.get("created_at", ""),
+                    "events": events,
+                }
+            )
+    return audits
 
 
 # Inline comment responses are capped well below the MCP client's 16 MB
 # per-message limit; JSON-RPC string escaping inflates them further in transit.
 _COMMENTS_INLINE_MAX_BYTES = 1_000_000
 _BULK_COMMENTS_MAX_BYTES = 4_000_000
+
+
+class _CursorRejected(Exception):
+    """Zendesk rejected the first request of a call resumed from a caller's cursor."""
 
 
 class _CommentThreadTooLarge(Exception):
@@ -1133,7 +1764,12 @@ class _CommentThreadTooLarge(Exception):
 
 
 def _fetch_comments(
-    ticket_id: int, max_bytes: int | None, *, auth: ZendeskAuth | None = None
+    ticket_id: int,
+    max_bytes: int | None,
+    *,
+    deadline: float | None,
+    auth: ZendeskAuth | None = None,
+    start_url: str | None = None,
 ) -> list[dict]:
     """Fetch all comments for one ticket, paginated, with 429 backoff.
 
@@ -1141,6 +1777,8 @@ def _fetch_comments(
         ticket_id: The Zendesk ticket ID.
         max_bytes: Stop after the page that pushes the projected JSON past this
             many bytes. None fetches the whole thread.
+        deadline: From `_call_deadline()`, resolved in the tool's thread; None for no limit.
+        start_url: A checked cursor (see `_cursor_url`) to resume from; None starts at page 1.
         auth: Credentials to send. Pass the caller's when running in a worker thread;
             None resolves them with `_zendesk_auth()` in the current thread.
 
@@ -1149,12 +1787,29 @@ def _fetch_comments(
 
     Raises:
         _CommentThreadTooLarge: The thread exceeds `max_bytes`.
+        _DeadlineReached: The deadline stopped the fetch; `partial` holds the comments so far
+            and `next_cursor` the page to resume from.
+        _CursorRejected: Zendesk answered 400, 404 or 422 to the `start_url` request.
     """
     comments: list[dict] = []
     total_bytes = 0
-    url: str | None = f"/tickets/{ticket_id}/comments.json"
+    thread_path = f"/tickets/{ticket_id}/comments.json"
+    url: str | None = start_url or thread_path
+    pages = 0
     while url:
-        data = _get_with_retry(url, auth=auth)
+        try:
+            data = _get_with_retry(url, auth=auth, deadline=deadline)
+        except _DeadlineReached as stop:
+            raise _DeadlineReached(
+                partial=comments,
+                next_cursor=_checked_page_cursor(url, thread_path),
+                progressed=pages > 0,
+            ) from stop
+        except httpx.HTTPStatusError as error:
+            if _is_cursor_rejection(error, start_url, first_request=pages == 0):
+                raise _CursorRejected() from error
+            raise
+        pages += 1
         for raw_comment in data.get("comments", []):
             projected = _project_comment(raw_comment)
             comments.append(projected)
@@ -1167,6 +1822,14 @@ def _fetch_comments(
 
 @mcp.tool()
 @_http_doc_remove("(fetch it with `export_ticket_comments`)", "")
+@_http_doc_time_budget(
+    "returns the threads fetched so far, a `warning`, and `unfinished`, which maps each "
+    "incomplete ticket_id to a cursor; finish each with get_ticket_comments(ticket_id, "
+    "cursor=...) and append the result. A thread that cannot be resumed is listed in `errors` "
+    "instead. An answer over the size limit has a `warning` and no `unfinished`: retry with "
+    "fewer ticket_ids. If a resumed ticket was deleted meanwhile, the resume reports an invalid "
+    "cursor"
+)
 def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) -> str:
     """Bulk-fetch comments for many tickets in parallel.
 
@@ -1192,23 +1855,39 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
 
     results: dict[str, list] = {}
     errors: dict[str, str] = {}
+    unfinished: dict[str, str] = {}
     # Resolved here: contextvars do not carry into executor threads by default.
     caller_auth = _zendesk_auth()
+    caller_deadline = _call_deadline()
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {
-            ex.submit(_fetch_comments, tid, _COMMENTS_INLINE_MAX_BYTES, auth=caller_auth): tid
+            ex.submit(
+                _fetch_comments,
+                tid,
+                _COMMENTS_INLINE_MAX_BYTES,
+                auth=caller_auth,
+                deadline=caller_deadline,
+            ): tid
             for tid in ticket_ids
         }
         for fut in as_completed(futures):
             tid = futures[fut]
             try:
                 results[str(tid)] = fut.result()
+            except _DeadlineReached as stop:
+                if stop.next_cursor is None:
+                    errors[str(tid)] = f"Incomplete. {stop} {_CURSOR_NOT_RESUMABLE}"
+                else:
+                    results[str(tid)] = stop.partial
+                    unfinished[str(tid)] = stop.next_cursor
             except Exception as exc:  # noqa: BLE001 — one failed ticket must not kill the batch
                 errors[str(tid)] = str(exc)
 
+    resume = _bulk_resume_fields(unfinished, len(ticket_ids))
     out: dict = {"comments_by_ticket": results}
     if errors:
         out["errors"] = errors
+    out |= resume
     serialized = json.dumps(out, indent=2)
     if len(serialized) <= _BULK_COMMENTS_MAX_BYTES:
         return serialized
@@ -1218,13 +1897,40 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
     }
     if errors:
         oversized["errors"] = errors
+    if unfinished:
+        # No comments are returned here, so a cursor would skip the ones fetched before the stop.
+        oversized["warning"] = "The time budget also ran out before every thread was fetched."
     return json.dumps(oversized, indent=2)
+
+
+def _bulk_resume_fields(unfinished: dict[str, str], ticket_count: int) -> dict:
+    """Build the resume part of a get_comments_for_tickets answer.
+
+    Args:
+        unfinished: Cursor per ticket_id whose thread the time budget cut short.
+        ticket_count: How many tickets the call asked for.
+
+    Returns:
+        `unfinished` and a `warning` that says how to finish each thread; empty when none.
+    """
+    if not unfinished:
+        return {}
+    warning = (
+        f"{len(unfinished)} of {ticket_count} threads are incomplete: the time budget ran out. "
+        "For each ticket_id in `unfinished`, call get_ticket_comments with that ticket_id and "
+        "`cursor` set to its value, and append the result."
+    )
+    return {"unfinished": unfinished, "warning": warning}
 
 
 _IMAGE_FORMAT_ALLOWLIST = {"png", "jpeg", "gif", "webp"}
 
 
+_ATTACHMENT_TIMEOUT_SECONDS = 60.0
+
+
 @mcp.tool()
+@_http_doc_time_budget("returns `kind: stopped_by_time_budget` instead of the content")
 def fetch_attachment(url: str, max_size_mb: int = 10):
     """Fetch the contents of a Zendesk attachment by URL.
 
@@ -1254,12 +1960,48 @@ def fetch_attachment(url: str, max_size_mb: int = 10):
         )
 
     max_bytes = max_size_mb * 1024 * 1024
+    deadline = _call_deadline()
+    timeout = _ATTACHMENT_TIMEOUT_SECONDS
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout < _DEADLINE_MIN_REQUEST_SECONDS:
+            return _attachment_stopped(0)
+    try:
+        return _stream_attachment(url, max_bytes, timeout, deadline)
+    except httpx.TimeoutException:
+        if deadline is None:
+            raise
+        return _attachment_stopped(None)
 
+
+def _attachment_stopped(bytes_read: int | None) -> str:
+    """Build fetch_attachment's answer when the /zendesk/mcp time budget runs out.
+
+    Args:
+        bytes_read: Bytes received before the stop, or None when unknown.
+
+    Returns:
+        JSON with `kind` "stopped_by_time_budget" and a `warning`.
+    """
+    return json.dumps(
+        {
+            "kind": "stopped_by_time_budget",
+            "bytes_read": bytes_read,
+            "warning": str(_DeadlineReached()),
+        },
+        indent=2,
+    )
+
+
+def _stream_attachment(
+    url: str, max_bytes: int, timeout: float, deadline: float | None
+) -> str | Image:
+    """Stream one attachment for fetch_attachment; the URL guard has already passed."""
     with httpx.stream(
         "GET",
         url,
         auth=_zendesk_auth(),
-        timeout=60.0,
+        timeout=timeout,
         follow_redirects=False,
     ) as resp:
         if resp.is_redirect:
@@ -1302,6 +2044,8 @@ def fetch_attachment(url: str, max_size_mb: int = 10):
             if len(buf) > max_bytes:
                 too_large = True
                 break
+            if deadline is not None and time.monotonic() > deadline:
+                return _attachment_stopped(len(buf))
 
         if too_large:
             return json.dumps(
@@ -1315,6 +2059,19 @@ def fetch_attachment(url: str, max_size_mb: int = 10):
 
         content = bytes(buf)
 
+    return _attachment_content(content, content_type)
+
+
+def _attachment_content(content: bytes, content_type: str) -> str | Image:
+    """Turn a fetched attachment into fetch_attachment's answer (image, text or metadata).
+
+    Args:
+        content: The attachment bytes, already within the size cap.
+        content_type: The response's media type, lowercased, without parameters.
+
+    Returns:
+        An Image for images, decoded text for text-like types, otherwise JSON metadata.
+    """
     if content_type.startswith("image/"):
         fmt_raw = content_type.removeprefix("image/").split("+")[0]
         if fmt_raw == "jpg":
@@ -1347,7 +2104,30 @@ _ARTICLES_PER_PAGE = 100
 _ARTICLES_MAX_PAGES = math.ceil(_ARTICLES_MAX_RESULTS / _ARTICLES_PER_PAGE)
 
 
+def _article_search_params(
+    query: str, label_names: list[str], sort_by: str, sort_order: str
+) -> dict:
+    """Build the first-page query parameters for search_articles.
+
+    Args:
+        query: The search text.
+        label_names: Cleaned label names; may be empty.
+        sort_by: Sort field, or "" for relevance.
+        sort_order: "asc" or "desc"; used only with `sort_by`.
+
+    Returns:
+        The parameters for page 1.
+    """
+    params: dict = {"query": query, "page": 1, "per_page": _ARTICLES_PER_PAGE}
+    if label_names:
+        params["label_names"] = ",".join(label_names)
+    if sort_by:
+        params |= {"sort_by": sort_by, "sort_order": sort_order}
+    return params
+
+
 @mcp.tool()
+@_http_doc_time_budget()
 def search_articles(
     query: str = "",
     label_names: list[str] | None = None,
@@ -1399,18 +2179,25 @@ def search_articles(
     )
     if errors:
         return json.dumps(errors)
-    params: dict = {"query": query, "page": 1, "per_page": _ARTICLES_PER_PAGE}
-    if label_names:
-        params["label_names"] = ",".join(label_names)
-    if sort_by:
-        params |= {"sort_by": sort_by, "sort_order": sort_order}
+    params = _article_search_params(query, label_names, sort_by, sort_order)
     articles: list[dict] = []
     count = 0
     page_count = 0
     limit = max(1, min(max_results, _ARTICLES_MAX_RESULTS))
     warning: str = ""
+    deadline = _call_deadline()
+    budget_stop: _DeadlineReached | None = None
     while page_count < _ARTICLES_MAX_PAGES:
-        data = _get_with_retry("/help_center/articles/search.json", params=params)
+        try:
+            data = _get_with_retry(
+                "/help_center/articles/search.json", params=params, deadline=deadline
+            )
+        except _DeadlineReached as stop:
+            budget_stop = stop
+            warning = (
+                f"Showing {min(len(articles), limit)} articles; the list may be incomplete. {stop}"
+            )
+            break
         count = count or data.get("count", 0)
         articles.extend([_project_article(a) for a in data.get("results", [])])
         next_page = data.get("next_page")
@@ -1432,7 +2219,7 @@ def search_articles(
             break
         params["page"] += 1
 
-    if not articles:
+    if not articles and budget_stop is None:
         return "No articles found."
     out: dict = {
         "articles": articles[:limit],
@@ -1581,6 +2368,7 @@ _CONTENT_TAGS_MAX_RESULTS = _CONTENT_TAGS_PAGE_SIZE * _CONTENT_TAGS_MAX_PAGES
 
 
 @mcp.tool()
+@_http_doc_time_budget()
 def list_content_tags() -> str:
     """List all Help Center content tags.
 
@@ -1597,8 +2385,14 @@ def list_content_tags() -> str:
     content_tags = []
     truncated_by: str | None = None
     pages = 0
+    deadline = _call_deadline()
+    budget_stop: _DeadlineReached | None = None
     while True:
-        data = _get_with_retry("/guide/content_tags", params=params)
+        try:
+            data = _get_with_retry("/guide/content_tags", params=params, deadline=deadline)
+        except _DeadlineReached as stop:
+            budget_stop = stop
+            break
         pages += 1
         for content_tag in data.get("records", []):
             content_tags.append(
@@ -1621,14 +2415,16 @@ def list_content_tags() -> str:
             break
         params["page[after]"] = meta["after_cursor"]
 
-    if not content_tags:
+    if not content_tags and budget_stop is None:
         return "No content tags found."
 
     out: dict = {
         "returned_count": len(content_tags),
         "content_tags": content_tags,
     }
-    if truncated_by:
+    if budget_stop is not None:
+        out["warning"] = f"The list may be incomplete. {budget_stop}"
+    elif truncated_by:
         out["warning"] = (
             f"Result set incomplete — stopped by {truncated_by}; more content tags exist."
         )
@@ -2223,7 +3019,10 @@ if TRANSPORT == "streamable-http":
     from starlette.types import ASGIApp, Receive, Scope, Send
 
     class _EndpointTag:
-        """ASGI wrapper that records which endpoint a request arrived on, for _current_endpoint.
+        """ASGI wrapper that records which endpoint a request arrived on, and when.
+
+        It sits outside the token check, so the arrival time it records for `_call_deadline`
+        includes that check.
 
         A class, not a function: Starlette treats a plain function endpoint as a request handler.
         """
@@ -2233,7 +3032,8 @@ if TRANSPORT == "streamable-http":
             self.endpoint = endpoint
 
         async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-            await self.app({**scope, _ENDPOINT_SCOPE_KEY: self.endpoint}, receive, send)
+            tags = {_ENDPOINT_SCOPE_KEY: self.endpoint, _REQUEST_START_SCOPE_KEY: time.monotonic()}
+            await self.app({**scope, **tags}, receive, send)
 
     # Every token must carry `read`; the SDK answers 403 insufficient_scope otherwise.
     _REQUIRED_SCOPES = ["read"]
@@ -2393,7 +3193,8 @@ if TRANSPORT == "streamable-http":
         """Wrap one endpoint so it answers 401 without a Zendesk token that has every required scope.
 
         Args:
-            endpoint_app: The tagged MCP transport endpoint.
+            endpoint_app: The MCP transport endpoint. `_EndpointTag` wraps the result, so the
+                arrival time it records includes this token check.
             path: The endpoint path; its metadata URL goes in the 401 `WWW-Authenticate` header.
 
         Returns:
@@ -2423,9 +3224,10 @@ if TRANSPORT == "streamable-http":
 
         Returns:
             The FastMCP Starlette app, with its single MCP route replaced by two routes that
-            share the same transport endpoint and session manager. Each route is tagged with its
-            endpoint and wrapped by `_require_caller_auth`, so it answers 401 without a valid
-            Zendesk token. The OAuth discovery routes and the `/oauth/authorize` redirect from
+            share the same transport endpoint and session manager. Each route is wrapped by
+            `_require_caller_auth`, so it answers 401 without a valid Zendesk token, and then
+            by `_EndpointTag` on the outside, so the recorded arrival time includes the token
+            check. The OAuth discovery routes and the `/oauth/authorize` redirect from
             `_oauth_metadata_routes` are appended.
 
         Raises:
@@ -2445,14 +3247,16 @@ if TRANSPORT == "streamable-http":
         http_app.router.routes[index : index + 1] = [
             Route(
                 ZENDESK_FLOW_PATH,
-                endpoint=_require_caller_auth(
-                    _EndpointTag(transport_endpoint, Endpoint.ZENDESK_FLOW), ZENDESK_FLOW_PATH
+                endpoint=_EndpointTag(
+                    _require_caller_auth(transport_endpoint, ZENDESK_FLOW_PATH),
+                    Endpoint.ZENDESK_FLOW,
                 ),
             ),
             Route(
                 CLAUDE_CODE_PATH,
-                endpoint=_require_caller_auth(
-                    _EndpointTag(transport_endpoint, Endpoint.CLAUDE_CODE), CLAUDE_CODE_PATH
+                endpoint=_EndpointTag(
+                    _require_caller_auth(transport_endpoint, CLAUDE_CODE_PATH),
+                    Endpoint.CLAUDE_CODE,
                 ),
             ),
         ]

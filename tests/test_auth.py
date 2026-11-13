@@ -71,7 +71,7 @@ def _call_get() -> object:
 
 def _call_get_with_retry() -> object:
     """Call `_get_with_retry` once."""
-    return server._get_with_retry("/tickets/1.json")
+    return server._get_with_retry("/tickets/1.json", deadline=None)
 
 
 def _call_post() -> object:
