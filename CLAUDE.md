@@ -15,8 +15,9 @@ virtualenv or `uv`/`uvx`.
 
 ## Repository Overview
 
-**zendesk-mcp** is a single-file MCP server (`server.py`) exposing Zendesk tools over stdio,
-built on `FastMCP` and `httpx`.
+**zendesk-mcp** is an MCP server in `server.py` exposing Zendesk tools over stdio, built on
+`FastMCP` and `httpx`, plus `stdio_oauth.py`: the stdio user's OAuth token store. It adds no
+tools, never imports `server`, and reads no env vars.
 
 - Tool availability is gated by the `ACCESS_LEVEL` env var: `readonly` (search/read/count/
   export), `management` (+ create/update tickets, comments, tags), `admin` (+ user/org CRUD,
@@ -24,6 +25,9 @@ built on `FastMCP` and `httpx`.
   `@mcp.tool()` registrations — a tool that isn't registered can't be called.
 - Configuration comes from `.env` next to `server.py`: `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`,
   `ZENDESK_API_KEY`, `ACCESS_LEVEL`. Missing required vars fail at import — keep it that way.
+- OAuth tokens live in `~/.config/zendesk-mcp/tokens.json` (0600; the directory is 0700), with
+  `tokens.lock` as the cross-process `fcntl.flock`. `stdio_oauth` must not log tokens or show
+  them in a repr or an error.
 
 ## Detected Tooling
 
@@ -81,7 +85,9 @@ These are the repo-specific rules that matter most in review:
 - **Use the shared HTTP helpers** (`_get`, `_post`, `_put`, `_delete`) — never construct a
   second `httpx.Client`. For loops issuing many requests, use `_get_with_retry`, which
   honors `Retry-After` on 429 with capped attempts/backoff so a rate-limit storm fails fast
-  instead of stalling.
+  instead of stalling. `stdio_oauth.TokenStore` takes its `httpx.Client` as an argument and
+  never builds one. The stdio OAuth wiring planned in #53 will pass `server.py`'s
+  `_client`.
 - **Register new tools in the right access-level block.** Anything that mutates Zendesk
   belongs under `management` or `admin`, never in the readonly section. Destructive or
   irreversible operations (delete, merge, bulk update) are admin-only, and their docstrings
