@@ -7,7 +7,8 @@ refresh when another process has already rotated the tokens. Zendesk refresh tok
 use, so refreshing twice with the same one would sign a session out.
 
 Tokens never appear in a repr, an error message, or a chained exception, and the module does no
-logging. It reads no env vars, and the caller passes in the `httpx.Client`.
+logging. It reads no env vars, and the caller passes in the `httpx.Client`. Login lives in
+`stdio_login.py`.
 
 Never import `server` from here: `server.py` checks its env vars at import time and will import
 this module, so an import back would make a cycle.
@@ -54,7 +55,7 @@ _FLOCK_POLL_SECONDS = 0.05
 # An OAuth `error` value goes into exception text only when it fully matches this.
 _OAUTH_ERROR_CODE = re.compile(r"[a-z_]{1,64}")
 
-LOGIN_HINT = "Run the zendesk-mcp login command."
+LOGIN_HINT = "To sign in, run .venv/bin/python stdio_login.py in the folder that holds server.py."
 _SIGN_IN_EXPIRED_MESSAGE = f"Zendesk sign-in expired or was revoked. {LOGIN_HINT}"
 _NO_SIGN_IN_MESSAGE = f"No Zendesk sign-in found. {LOGIN_HINT}"
 _OTHER_ACCOUNT_MESSAGE = (
@@ -94,7 +95,8 @@ class TokenSet:
         client_id: The OAuth client's Identifier string (not its numeric ID).
         access_token: The bearer token for API requests.
         refresh_token: The single-use token that gets the next set.
-        scope: Space-separated scopes, as Zendesk returns them (for example "read write").
+        scope: Space-separated scopes (for example "read write"). A refresh keeps only scopes the
+            previous set had, so it never widens.
         access_token_expires_at: Epoch seconds (wall clock) when the access token expires.
         refresh_token_expires_at: Epoch seconds when the refresh token expires, or None when
             Zendesk did not say.
@@ -112,7 +114,7 @@ class TokenSet:
 
     @property
     def scopes(self) -> frozenset[str]:
-        """The granted scopes as a set."""
+        """The saved scopes as a set."""
         return frozenset(self.scope.split())
 
     def expires_soon(self, now: float) -> bool:
@@ -206,7 +208,8 @@ class TokenSet:
             client_id: The OAuth client's Identifier string.
             now: The current wall-clock time in epoch seconds.
             previous: The set being refreshed, or None for a first sign-in. Its scope is kept
-                when the answer has no `scope`.
+                when the answer has no `scope`. A string `scope` in the answer is clipped to the
+                previous scopes.
             requested_scope: The `scope` sent with the request ("" if none), used when the answer
                 has no `scope` and there is no `previous`.
 
@@ -227,6 +230,9 @@ class TokenSet:
         scope = body.get("scope")
         if not isinstance(scope, str):
             scope = previous.scope if previous is not None else requested_scope
+        elif previous is not None:
+            # A refresh never widens the saved scope: keep only scopes the previous set had.
+            scope = " ".join(sorted(previous.scopes & frozenset(scope.split())))
         issued_at = int(now)
         access_lifetime = body.get("expires_in")
         if not _is_int(access_lifetime):
@@ -374,6 +380,7 @@ class TokenStore:
         Args:
             grant_fields: The grant's form fields, for example `grant_type` and `refresh_token`.
             previous: The set being refreshed, or None. Its scope is kept when the answer has none.
+                A string `scope` in the answer is clipped to the previous scopes.
 
         Returns:
             The new token set.
@@ -461,8 +468,9 @@ class TokenStore:
             if current.refresh_token_expired(now):
                 raise LoginRequiredError(_SIGN_IN_EXPIRED_MESSAGE)
             grant_fields = {"grant_type": "refresh_token", "refresh_token": current.refresh_token}
-            # Sending the stored scope keeps the granted scope stable across refreshes. An empty
-            # scope is left out rather than sent as `scope=`.
+            # Sending the stored scope keeps the granted scope stable across refreshes, and the
+            # answer is clipped to it in `from_token_response`. An empty scope is left out rather
+            # than sent as `scope=`.
             if current.scope:
                 grant_fields["scope"] = current.scope
             new_token_set = self.request_tokens(grant_fields, previous=current)
