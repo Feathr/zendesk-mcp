@@ -10,6 +10,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import select
 import stat
 import subprocess
@@ -251,9 +252,9 @@ def test_load_returns_none_without_file(token_dir: Path) -> None:
     store = make_store(token_dir, endpoint)
 
     assert store.load() is None
-    with pytest.raises(LoginRequiredError, match=LOGIN_HINT):
+    with pytest.raises(LoginRequiredError, match=re.escape(LOGIN_HINT)):
         store.get_access_token()
-    with pytest.raises(LoginRequiredError, match=LOGIN_HINT):
+    with pytest.raises(LoginRequiredError, match=re.escape(LOGIN_HINT)):
         store.refresh_access_token("access-1")
     assert not token_dir.exists()
     assert endpoint.requests == []
@@ -268,7 +269,7 @@ def test_load_rejects_other_subdomain_or_client(token_dir: Path, overrides: dict
     write_token_file(token_dir, **overrides)
     store = make_store(token_dir, TokenEndpoint())
 
-    with pytest.raises(LoginRequiredError, match=LOGIN_HINT):
+    with pytest.raises(LoginRequiredError, match=re.escape(LOGIN_HINT)):
         store.load()
 
 
@@ -424,7 +425,7 @@ def test_expired_refresh_token_raises_login_required_without_request(token_dir: 
     endpoint = TokenEndpoint()
     store = make_store(token_dir, endpoint)
 
-    with pytest.raises(LoginRequiredError, match=LOGIN_HINT):
+    with pytest.raises(LoginRequiredError, match=re.escape(LOGIN_HINT)):
         store.get_access_token()
     assert endpoint.requests == []
 
@@ -843,7 +844,7 @@ def test_invalid_grant_on_401_raises_login_required(token_dir: Path) -> None:
     before = path.read_bytes()
     store = make_store(token_dir, _respond(401, {"error": "invalid_grant"}))
 
-    with pytest.raises(LoginRequiredError, match=LOGIN_HINT):
+    with pytest.raises(LoginRequiredError, match=re.escape(LOGIN_HINT)):
         store.get_access_token()
     assert path.read_bytes() == before
 
@@ -863,6 +864,43 @@ def test_answer_scope_wins_over_fallback(token_dir: Path) -> None:
     saved = store.load()
     assert saved is not None
     assert saved.scope == "read"
+
+
+def test_refresh_wider_answer_keeps_stored_scope(token_dir: Path) -> None:
+    parsed = parse_answer(answer_with("scope", "read write"), previous=make_token_set(scope="read"))
+    assert parsed.scope == "read"
+
+    write_token_file(token_dir, scope="read", access_token_expires_at=START + 60)
+    store = make_store(token_dir, _respond(201, answer_with("scope", "read write")))
+
+    assert store.get_access_token() == "access-2"
+    saved = store.load()
+    assert saved is not None
+    assert saved.scope == "read"
+
+
+def test_refresh_narrower_answer_narrows_stored_scope(token_dir: Path) -> None:
+    # The clip keeps only scopes the previous set had; it must not undo a narrower answer.
+    write_token_file(token_dir, scope="read write", access_token_expires_at=START + 60)
+    store = make_store(token_dir, _respond(201, answer_with("scope", "read")))
+
+    assert store.get_access_token() == "access-2"
+    saved = store.load()
+    assert saved is not None
+    assert saved.scope == "read"
+
+
+def test_refresh_empty_stored_scope_stays_empty(token_dir: Path) -> None:
+    write_token_file(token_dir, scope="", access_token_expires_at=START + 60)
+    endpoint = TokenEndpoint()  # answers scope "read write"
+    store = make_store(token_dir, endpoint)
+
+    assert store.get_access_token() == "access-2"
+
+    assert len(endpoint.requests) == 1
+    saved = store.load()
+    assert saved is not None
+    assert saved.scope == ""
 
 
 def test_store_requires_fcntl(token_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:

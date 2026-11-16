@@ -16,3 +16,5 @@ os.environ["ACCESS_LEVEL"] = "readonly"
 os.environ["MCP_TRANSPORT"] = "stdio"
 # HTTP mode requires it; matches client_id 7 in the stubbed tokens/current answers.
 os.environ["ZENDESK_OAUTH_CLIENT_ID"] = "7"
+# The stdio login's OAuth client Identifier, so a `main()` test never picks up a real `.env` value.
+os.environ["ZENDESK_STDIO_OAUTH_CLIENT_ID"] = "zendesk_mcp_stdio"

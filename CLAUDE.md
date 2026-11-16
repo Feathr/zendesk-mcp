@@ -17,7 +17,10 @@ virtualenv or `uv`/`uvx`.
 
 **zendesk-mcp** is an MCP server in `server.py` exposing Zendesk tools over stdio, built on
 `FastMCP` and `httpx`, plus `stdio_oauth.py`: the stdio user's OAuth token store. It adds no
-tools, never imports `server`, and reads no env vars.
+tools, never imports `server`, and reads no env vars. `stdio_login.py` is the stdio user's
+one-time sign-in, run by hand in a terminal (`.venv/bin/python stdio_login.py`). It reads `.env`
+itself (`ZENDESK_SUBDOMAIN`, `ACCESS_LEVEL`, `ZENDESK_STDIO_OAUTH_CLIENT_ID`). It never imports
+`server` or `mcp`, and only its tests import it.
 
 - Tool availability is gated by the `ACCESS_LEVEL` env var: `readonly` (search/read/count/
   export), `management` (+ create/update tickets, comments, tags), `admin` (+ user/org CRUD,
@@ -25,9 +28,11 @@ tools, never imports `server`, and reads no env vars.
   `@mcp.tool()` registrations — a tool that isn't registered can't be called.
 - Configuration comes from `.env` next to `server.py`: `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`,
   `ZENDESK_API_KEY`, `ACCESS_LEVEL`. Missing required vars fail at import — keep it that way.
+  `ZENDESK_STDIO_OAUTH_CLIENT_ID` is the stdio OAuth client's *Identifier* string, not HTTP
+  mode's numeric `ZENDESK_OAUTH_CLIENT_ID`; for now only `stdio_login.py` reads it.
 - OAuth tokens live in `~/.config/zendesk-mcp/tokens.json` (0600; the directory is 0700), with
-  `tokens.lock` as the cross-process `fcntl.flock`. `stdio_oauth` must not log tokens or show
-  them in a repr or an error.
+  `tokens.lock` as the cross-process `fcntl.flock`. `stdio_oauth` and `stdio_login` must not
+  log tokens, the authorization code or the PKCE verifier, or show them in a repr or an error.
 
 ## Detected Tooling
 
@@ -87,7 +92,8 @@ These are the repo-specific rules that matter most in review:
   honors `Retry-After` on 429 with capped attempts/backoff so a rate-limit storm fails fast
   instead of stalling. `stdio_oauth.TokenStore` takes its `httpx.Client` as an argument and
   never builds one. The stdio OAuth wiring planned in #53 will pass `server.py`'s
-  `_client`.
+  `_client`. `stdio_login` runs in its own process: its `_login_from_env()` builds one
+  short-lived `httpx.Client`, which it passes to `TokenStore`. The rule above is about `server.py`.
 - **Register new tools in the right access-level block.** Anything that mutates Zendesk
   belongs under `management` or `admin`, never in the readonly section. Destructive or
   irreversible operations (delete, merge, bulk update) are admin-only, and their docstrings
