@@ -6,6 +6,17 @@ Access levels controlled by ACCESS_LEVEL env var:
     management — readonly + create/update tickets, comments, tags, file attachments (24 tools)
     admin      — management + user/org CRUD, merge, bulk ops, delete (33 tools)
 
+Stdio signs in with each user's own Zendesk OAuth token: set ZENDESK_STDIO_OAUTH_CLIENT_ID (the
+stdio OAuth client's Identifier) and run `.venv/bin/python stdio_login.py` once. Tokens live in
+~/.config/zendesk-mcp/ (see stdio_oauth.py) and refresh on their own. With a sign-in, write tools
+also need its `write` scope; ACCESS_LEVEL stays the ceiling. Until the fallback is removed (by
+2027-03-31; Zendesk API tokens stop working on 2027-04-30), stdio uses ZENDESK_EMAIL /
+ZENDESK_API_KEY, with one warning on stderr, when ZENDESK_STDIO_OAUTH_CLIENT_ID is unset, when
+there is no token file, or on a system without fcntl (native Windows); that path has no scope
+gate. The API token is used only when both ZENDESK_EMAIL and ZENDESK_API_KEY are set; otherwise
+each call says "No Zendesk sign-in found". Stdio needs the client ID or the email/key pair, or
+import fails.
+
 Transport is set by MCP_TRANSPORT: `stdio` (default) or `streamable-http`. HTTP mode reads
 MCP_HOST (default 127.0.0.1) and MCP_PORT (default 8000). It serves the same tools at
 /zendesk/mcp (Zendesk action flows) and /claude/mcp (Claude Code), plus /health. It omits
