@@ -35,6 +35,8 @@ import math
 import mimetypes
 import os
 import re
+import sys
+import threading
 import time
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,6 +50,8 @@ import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP, Image
 
+import stdio_oauth
+
 if TYPE_CHECKING:
     from mcp.server.auth.provider import AccessToken
     from mcp.server.transport_security import TransportSecuritySettings
@@ -60,13 +64,22 @@ TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio").lower()
 if TRANSPORT not in ("stdio", "streamable-http"):
     raise ValueError(f"Invalid MCP_TRANSPORT: {TRANSPORT!r}. Must be stdio or streamable-http.")
 if TRANSPORT == "stdio":
-    EMAIL = os.environ["ZENDESK_EMAIL"]
-    API_KEY = os.environ["ZENDESK_API_KEY"]
+    # Stdio sends the user's own OAuth token (signed in with stdio_login.py). The email/key pair
+    # is the fallback for a user who has not signed in yet.
+    EMAIL = os.environ.get("ZENDESK_EMAIL") or None
+    API_KEY = os.environ.get("ZENDESK_API_KEY") or None
+    STDIO_OAUTH_CLIENT_ID: str | None = os.environ.get("ZENDESK_STDIO_OAUTH_CLIENT_ID") or None
     OAUTH_CLIENT_ID: str | None = None
+    if STDIO_OAUTH_CLIENT_ID is None and not (EMAIL and API_KEY):
+        raise KeyError(
+            "Stdio needs ZENDESK_STDIO_OAUTH_CLIENT_ID (then run stdio_login.py), or both "
+            "ZENDESK_EMAIL and ZENDESK_API_KEY."
+        )
 else:
     # HTTP mode sends each caller's own OAuth token; it never reads the API-token credentials.
     EMAIL: str | None = None
     API_KEY: str | None = None
+    STDIO_OAUTH_CLIENT_ID = None
     OAUTH_CLIENT_ID = os.environ["ZENDESK_OAUTH_CLIENT_ID"]
     if re.fullmatch(r"[1-9][0-9]*", OAUTH_CLIENT_ID) is None:
         raise ValueError(
@@ -744,6 +757,19 @@ _client = httpx.Client(
     cookies=_client_cookies,
 )
 
+# The stdio user's OAuth token store, on the shared client. Read as module globals at call time.
+# There is no store without a client ID, or without `fcntl` (Windows): auth then falls back to the
+# API token.
+_STDIO_TOKEN_DIR: Path = stdio_oauth.DEFAULT_TOKEN_DIR
+_STDIO_TOKEN_STORE: stdio_oauth.TokenStore | None = None
+if TRANSPORT == "stdio" and STDIO_OAUTH_CLIENT_ID and stdio_oauth.fcntl is not None:
+    _STDIO_TOKEN_STORE = stdio_oauth.TokenStore(
+        subdomain=SUBDOMAIN,
+        client_id=STDIO_OAUTH_CLIENT_ID,
+        http_client=_client,
+        directory=_STDIO_TOKEN_DIR,
+    )
+
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -763,6 +789,39 @@ class _BearerAuth(httpx.Auth):
 
     def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         request.headers["Authorization"] = f"Bearer {self._token}"
+        yield request
+
+
+class _StdioOAuth(httpx.Auth):
+    """Send the stdio user's OAuth access token from the token store. Its repr never shows it.
+
+    Each request reads the token file through `get_access_token()`, which refreshes a token that
+    is about to expire. A 401 refreshes once and sends the request again; that answer is final.
+    Every other status, a 403 included, is returned as is. Store errors propagate unchanged.
+    """
+
+    # Both are the httpx defaults, stated because they matter: the final response is returned
+    # unread, so fetch_attachment still streams it under its size cap. httpx does read a 401 body
+    # in full before the retry.
+    requires_request_body = False
+    requires_response_body = False
+
+    def __init__(self, store: stdio_oauth.TokenStore) -> None:
+        self._store = store
+
+    def __repr__(self) -> str:
+        return "_StdioOAuth(<redacted>)"
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        access_token = self._store.get_access_token()
+        request.headers["Authorization"] = f"Bearer {access_token}"
+        response = yield request
+        if response.status_code != 401:
+            return
+        # Passing the exact token Zendesk refused lets the store pick up a rotation by another
+        # session without a POST.
+        access_token = self._store.refresh_access_token(access_token)
+        request.headers["Authorization"] = f"Bearer {access_token}"
         yield request
 
 
@@ -793,16 +852,29 @@ def _caller_access_token() -> "AccessToken":
 
 
 def _require_write_scope() -> None:
-    """Refuse a write tool call over HTTP when the caller's token lacks the `write` scope.
+    """Refuse a write tool call when the OAuth token in use lacks the `write` scope.
 
-    Call it first in every tool that changes Zendesk data. Stdio has no OAuth token, so it does
-    nothing there; ACCESS_LEVEL still decides which write tools exist in either mode.
+    Call it first in every tool that changes Zendesk data. In stdio it checks the saved sign-in's
+    scopes, and does nothing on the API-token fallback (no token file). ACCESS_LEVEL still decides
+    which write tools exist in either mode.
 
     Raises:
-        PermissionError: HTTP mode, and the token's scopes do not include `write`.
+        PermissionError: The token's scopes do not include `write` (HTTP mode, or stdio with a
+            read-only sign-in).
         RuntimeError: HTTP mode, and the call has no authenticated caller.
+        LoginRequiredError: Stdio, and the token file is for another subdomain or client.
+        TokenStoreError: Stdio, and the token file is unusable.
+        OSError: Stdio, and the token file or directory could not be read.
     """
     if TRANSPORT == "stdio":
+        store = _STDIO_TOKEN_STORE
+        token_set = None if store is None else store.load()
+        if token_set is not None and "write" not in token_set.scopes:
+            raise PermissionError(
+                "This tool changes Zendesk data, and your saved Zendesk sign-in has no `write` "
+                "scope (Zendesk may have granted less than was requested). Sign in again to get "
+                "write access. " + stdio_oauth.LOGIN_HINT
+            )
         return
     if "write" not in _caller_access_token().scopes:
         raise PermissionError(
@@ -815,16 +887,86 @@ def _zendesk_auth() -> ZendeskAuth:
     """Return the credentials to send with the current Zendesk request.
 
     Returns:
-        In stdio mode, the basic-auth tuple ``("<email>/token", api_key)``. In HTTP mode, the
-        caller's own OAuth token as bearer auth; HTTP mode never uses the API-token credentials.
+        In stdio mode, `_StdioOAuth` when the user has signed in, else the basic-auth tuple
+        ``("<email>/token", api_key)`` (see `_stdio_auth`). In HTTP mode, the caller's own OAuth
+        token as bearer auth; HTTP mode never uses the API-token credentials.
 
     Raises:
         RuntimeError: HTTP mode, and the call has no authenticated caller (including a worker
             thread). No request is sent.
+        LoginRequiredError: Stdio, and the user must sign in (again).
+        TokenRefreshError: Stdio, and refreshing an expiring token failed.
+        TokenStoreError: Stdio, and the token file is unusable or the lock timed out.
+        OSError: Stdio, and the token file could not be read or written.
     """
     if TRANSPORT == "stdio":
-        return (f"{EMAIL}/token", API_KEY)
+        return _stdio_auth()
     return _BearerAuth(_caller_access_token().token)
+
+
+_API_TOKEN_FALLBACK_WARNING = (
+    "zendesk-mcp: no Zendesk OAuth sign-in found, so this session uses ZENDESK_EMAIL / "
+    "ZENDESK_API_KEY. Zendesk API tokens stop working on 2027-04-30."
+)
+_fallback_warning_lock = threading.Lock()
+_fallback_warned = False
+
+
+def _api_token_fallback_warning() -> str:
+    """Return the fallback warning, with the setup step the user still needs."""
+    if STDIO_OAUTH_CLIENT_ID is None:
+        return (
+            f"{_API_TOKEN_FALLBACK_WARNING} Set ZENDESK_STDIO_OAUTH_CLIENT_ID in .env, then sign "
+            f"in. {stdio_oauth.LOGIN_HINT}"
+        )
+    return f"{_API_TOKEN_FALLBACK_WARNING} {stdio_oauth.LOGIN_HINT}"
+
+
+def _warn_api_token_fallback_once() -> bool:
+    """Print the API-token fallback warning to stderr, once per process.
+
+    Stdio MCP speaks on stdout, so stderr is safe. The warning holds no secret.
+
+    Returns:
+        True if this call printed it.
+    """
+    global _fallback_warned
+    with _fallback_warning_lock:
+        if _fallback_warned:
+            return False
+        print(_api_token_fallback_warning(), file=sys.stderr, flush=True)
+        _fallback_warned = True
+        return True
+
+
+def _stdio_auth() -> ZendeskAuth:
+    """Return stdio's credentials: the OAuth token file when there is one, else the API token.
+
+    Chosen on every call, so a sign-in during a session counts from the next call. It falls back
+    only when there is no token file: an unusable file raises, so a user who has signed in never
+    runs on the API key without knowing. There is no `except` here, so store errors chain nothing.
+
+    Returns:
+        `_StdioOAuth` when a token file exists; otherwise the basic-auth tuple, after printing the
+        fallback warning once.
+
+    Raises:
+        LoginRequiredError: No token file and no email/key pair; a file for another account; or
+            a dead refresh token.
+        TokenRefreshError: Refreshing an expiring token failed.
+        TokenStoreError: The token file is unusable, or the lock timed out.
+        OSError: The token file could not be read or written.
+    """
+    store = _STDIO_TOKEN_STORE
+    if store is not None and store.load() is not None:
+        # In the tool's own thread: an expiring token is refreshed, or a dead sign-in fails, once
+        # here, before get_comments_for_tickets fans out to its workers.
+        store.get_access_token()
+        return _StdioOAuth(store)
+    if EMAIL and API_KEY:
+        _warn_api_token_fallback_once()
+        return (f"{EMAIL}/token", API_KEY)
+    raise stdio_oauth.LoginRequiredError(f"No Zendesk sign-in found. {stdio_oauth.LOGIN_HINT}")
 
 
 _CLIENT_TIMEOUT_SECONDS = 30.0
@@ -1542,7 +1684,8 @@ def export_ticket_comments(ticket_id: int, output_path: str) -> str:
     with a script rather than reading it into context. The file holds a
     compact JSON array in the same per-comment shape as `get_ticket_comments`.
     An existing file at `output_path` is overwritten; parent directories are
-    created. Retries 429s with Retry-After backoff.
+    created. Retries 429s with Retry-After backoff. Refuses an output_path in
+    the Zendesk token directory.
 
     Args:
         ticket_id: The Zendesk ticket ID.
@@ -1554,10 +1697,14 @@ def export_ticket_comments(ticket_id: int, output_path: str) -> str:
     path = Path(output_path).expanduser()
     if not path.is_absolute():
         return json.dumps({"error": "output_path must be an absolute path."})
+    resolved = path.resolve()
+    if _in_token_directory(resolved):
+        error = "output_path is in the Zendesk token directory; choose another path."
+        return json.dumps({"error": error})
     comments = _fetch_comments(ticket_id, max_bytes=None, deadline=None)  # stdio only
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(comments))
-    result = {"path": str(path), "comment_count": len(comments), "bytes": path.stat().st_size}
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(json.dumps(comments))
+    result = {"path": str(path), "comment_count": len(comments), "bytes": resolved.stat().st_size}
     return json.dumps(result, indent=2)
 
 
@@ -1855,6 +2002,7 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
 
     results: dict[str, list] = {}
     errors: dict[str, str] = {}
+    error_is_login: dict[str, bool] = {}
     unfinished: dict[str, str] = {}
     # Resolved here: contextvars do not carry into executor threads by default.
     caller_auth = _zendesk_auth()
@@ -1882,7 +2030,9 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
                     unfinished[str(tid)] = stop.next_cursor
             except Exception as exc:  # noqa: BLE001 — one failed ticket must not kill the batch
                 errors[str(tid)] = str(exc)
+                error_is_login[str(tid)] = isinstance(exc, stdio_oauth.LoginRequiredError)
 
+    _raise_if_only_login_errors(results, errors, error_is_login)
     resume = _bulk_resume_fields(unfinished, len(ticket_ids))
     out: dict = {"comments_by_ticket": results}
     if errors:
@@ -1901,6 +2051,31 @@ def get_comments_for_tickets(ticket_ids: list[int], max_concurrency: int = 8) ->
         # No comments are returned here, so a cursor would skip the ones fetched before the stop.
         oversized["warning"] = "The time budget also ran out before every thread was fetched."
     return json.dumps(oversized, indent=2)
+
+
+def _raise_if_only_login_errors(
+    results: dict[str, list], errors: dict[str, str], error_is_login: dict[str, bool]
+) -> None:
+    """Raise one sign-in error when every ticket failed only because the sign-in is dead.
+
+    A revoked sign-in whose access token still looks fresh passes `_stdio_auth()`'s up-front
+    check, so each worker gets a 401 and then `invalid_grant`. One error then replaces a map with
+    the same text for every ticket. Call it outside any `except` block, so the error chains nothing.
+
+    Args:
+        results: Comments per ticket that succeeded (or was cut short).
+        errors: Error text per ticket that failed.
+        error_is_login: Per ticket that raised, whether the error was a `LoginRequiredError`.
+
+    Raises:
+        LoginRequiredError: No ticket succeeded, and every failure was a `LoginRequiredError`.
+    """
+    login_errors = {ticket_id for ticket_id, is_login in error_is_login.items() if is_login}
+    if results or not errors or set(errors) != login_errors:
+        return
+    raise stdio_oauth.LoginRequiredError(
+        f"Zendesk sign-in expired or was revoked. {stdio_oauth.LOGIN_HINT}"
+    )
 
 
 def _bulk_resume_fields(unfinished: dict[str, str], ticket_count: int) -> dict:
@@ -2438,6 +2613,62 @@ def list_content_tags() -> str:
 _ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024  # Zendesk's per-file attachment limit
 
 
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    """Return a path's (device, inode), or None when it cannot be stat'ed."""
+    try:
+        status = os.stat(path)
+    except OSError:
+        return None
+    return (status.st_dev, status.st_ino)
+
+
+def _nearest_existing_ancestor(directory: Path) -> tuple[Path, tuple[str, ...]]:
+    """Split a directory into its nearest existing ancestor and the names below it that are missing.
+
+    Args:
+        directory: An absolute path.
+
+    Returns:
+        The deepest existing path that is `directory` or one of its parents, and the path parts
+        from there down to `directory` (empty when `directory` exists).
+    """
+    existing = directory
+    while _file_identity(existing) is None and existing != existing.parent:
+        existing = existing.parent
+    return existing, directory.relative_to(existing).parts
+
+
+def _in_token_directory(path: Path) -> bool:
+    """Return True when `path` is the stdio token directory or anything in it.
+
+    That covers `tokens.json`, `tokens.lock` and leftover `.tokens.*.tmp` files, also before the
+    directory exists. It finds the token directory's nearest existing ancestor and looks for the
+    same device and inode among `path` and its parents; the names below that ancestor are
+    compared case-insensitively. Besides plain paths, that catches a case-variant path on a
+    case-insensitive disk and macOS's `/System/Volumes/Data` form, which `resolve()` keeps as given.
+    Before the token directory exists, its missing part is compared case-insensitively on every
+    disk, so on a case-sensitive disk a case-variant sibling (`ZENDESK-MCP`) is also refused until
+    the directory exists.
+
+    Args:
+        path: An absolute, already resolved path.
+
+    Returns:
+        True if the path is in the token directory.
+    """
+    token_dir = _STDIO_TOKEN_DIR.expanduser().resolve()
+    anchor, missing_parts = _nearest_existing_ancestor(token_dir)
+    anchor_identity = _file_identity(anchor)
+    expected = [part.casefold() for part in missing_parts]
+    for candidate in (path, *path.parents):
+        if _file_identity(candidate) != anchor_identity:
+            continue
+        below = [part.casefold() for part in path.relative_to(candidate).parts]
+        if below[: len(expected)] == expected:
+            return True
+    return False
+
+
 def _resolve_attachment_paths(file_paths: list[str]) -> list[Path]:
     """Expand and validate local files before any of them are uploaded.
 
@@ -2448,8 +2679,8 @@ def _resolve_attachment_paths(file_paths: list[str]) -> list[Path]:
         Resolved paths, in the order given.
 
     Raises:
-        ValueError: If no paths are given, or any path is missing, not a regular
-            file, or larger than the attachment limit.
+        ValueError: If no paths are given, or any path is in the Zendesk token
+            directory, missing, not a regular file, or larger than the attachment limit.
     """
     if not file_paths:
         raise ValueError("file_paths must contain at least one path.")
@@ -2457,6 +2688,9 @@ def _resolve_attachment_paths(file_paths: list[str]) -> list[Path]:
     problems: list[str] = []
     for raw_path in file_paths:
         path = Path(raw_path).expanduser().resolve()
+        if _in_token_directory(path):
+            problems.append(f"{raw_path}: is in the Zendesk token directory; refusing to upload it")
+            continue
         if not path.is_file():
             problems.append(f"{raw_path}: not found or not a regular file")
             continue
@@ -2661,7 +2895,8 @@ if ACCESS_LEVEL in ("management", "admin"):
         Defaults to an internal note; set public=True only when the requester should
         receive the files. All paths are checked before anything is uploaded, so a bad
         path fails without posting a partial comment. Files over 50 MB are rejected
-        (Zendesk's attachment limit).
+        (Zendesk's attachment limit). Refuses files in the Zendesk token directory
+        (`~/.config/zendesk-mcp`).
 
         Args:
             ticket_id: The ticket to attach the files to.

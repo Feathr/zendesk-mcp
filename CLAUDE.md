@@ -26,10 +26,16 @@ itself (`ZENDESK_SUBDOMAIN`, `ACCESS_LEVEL`, `ZENDESK_STDIO_OAUTH_CLIENT_ID`). I
   export), `management` (+ create/update tickets, comments, tags), `admin` (+ user/org CRUD,
   merge, bulk ops, delete). Gating is done with `if ACCESS_LEVEL ...` blocks around the
   `@mcp.tool()` registrations — a tool that isn't registered can't be called.
-- Configuration comes from `.env` next to `server.py`: `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`,
-  `ZENDESK_API_KEY`, `ACCESS_LEVEL`. Missing required vars fail at import — keep it that way.
-  `ZENDESK_STDIO_OAUTH_CLIENT_ID` is the stdio OAuth client's *Identifier* string, not HTTP
-  mode's numeric `ZENDESK_OAUTH_CLIENT_ID`; for now only `stdio_login.py` reads it.
+- Configuration comes from `.env` next to `server.py`: `ZENDESK_SUBDOMAIN`, `ACCESS_LEVEL`, and
+  for stdio `ZENDESK_STDIO_OAUTH_CLIENT_ID` or both `ZENDESK_EMAIL` and `ZENDESK_API_KEY`.
+  Missing required vars fail at import — keep it that way. `ZENDESK_STDIO_OAUTH_CLIENT_ID` is
+  the stdio OAuth client's *Identifier* string, not HTTP mode's numeric
+  `ZENDESK_OAUTH_CLIENT_ID`; `server.py` and `stdio_login.py` read it.
+- Stdio auth uses the token file when `ZENDESK_STDIO_OAUTH_CLIENT_ID` is set and the file
+  exists, and falls back to the API token (with one stderr warning) only when there is none;
+  an unusable file is an error, never a fallback.
+  `attach_file_to_ticket` and `export_ticket_comments` refuse paths in the token directory:
+  do not weaken that guard. Never call the token store inside an `except` block.
 - OAuth tokens live in `~/.config/zendesk-mcp/tokens.json` (0600; the directory is 0700), with
   `tokens.lock` as the cross-process `fcntl.flock`. `stdio_oauth` and `stdio_login` must not
   log tokens, the authorization code or the PKCE verifier, or show them in a repr or an error.
@@ -91,9 +97,9 @@ These are the repo-specific rules that matter most in review:
   second `httpx.Client`. For loops issuing many requests, use `_get_with_retry`, which
   honors `Retry-After` on 429 with capped attempts/backoff so a rate-limit storm fails fast
   instead of stalling. `stdio_oauth.TokenStore` takes its `httpx.Client` as an argument and
-  never builds one. The stdio OAuth wiring planned in #53 will pass `server.py`'s
-  `_client`. `stdio_login` runs in its own process: its `_login_from_env()` builds one
-  short-lived `httpx.Client`, which it passes to `TokenStore`. The rule above is about `server.py`.
+  never builds one; `server.py` passes its `_client`. `stdio_login` runs in its own process:
+  its `_login_from_env()` builds one short-lived `httpx.Client`, which it passes to
+  `TokenStore`. The rule above is about `server.py`.
 - **Register new tools in the right access-level block.** Anything that mutates Zendesk
   belongs under `management` or `admin`, never in the readonly section. Destructive or
   irreversible operations (delete, merge, bulk update) are admin-only, and their docstrings

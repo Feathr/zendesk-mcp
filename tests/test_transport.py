@@ -177,15 +177,17 @@ def test_stdio_admin_tool_names_unchanged(load_server: Callable[..., ModuleType]
     "transport,name",
     [
         ("stdio", "ZENDESK_SUBDOMAIN"),
-        ("stdio", "ZENDESK_EMAIL"),
-        ("stdio", "ZENDESK_API_KEY"),
         ("streamable-http", "ZENDESK_SUBDOMAIN"),
     ],
 )
 def test_missing_config_fails_at_import(
     load_server: Callable[..., ModuleType], transport: str, name: str
 ) -> None:
-    """A missing required var raises KeyError at import."""
+    """A missing required var raises KeyError at import.
+
+    Stdio's credentials (the OAuth client ID, or the email/key pair) are checked in
+    `tests/test_stdio_auth.py::test_stdio_import_needs_client_id_or_key_pair`.
+    """
     with pytest.raises(KeyError, match=name):
         load_server(MCP_TRANSPORT=transport, **{name: None})
 
