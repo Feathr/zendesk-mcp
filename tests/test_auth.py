@@ -113,8 +113,11 @@ def test_helpers_send_zendesk_auth(
     assert sent_requests[0].headers.get("authorization") == _basic_header(SENTINEL)
 
 
-def test_zendesk_auth_returns_basic_tuple() -> None:
-    """`_zendesk_auth()` returns the env basic-auth tuple, as stdio sends today."""
+def test_zendesk_auth_returns_basic_tuple_without_token_file() -> None:
+    """With no token file, `_zendesk_auth()` falls back to the env basic-auth tuple.
+
+    No token file exists because conftest points HOME at an empty temp dir.
+    """
     zendesk_auth = getattr(server, "_zendesk_auth", lambda: None)
 
     assert zendesk_auth() == ("env@example.com/token", "env-key")
@@ -293,8 +296,10 @@ async def _call_tool_in_memory(module: ModuleType, name: str, arguments: dict) -
     return result.isError, result.content[0].text
 
 
-def test_require_write_scope_noop_in_stdio(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """In stdio a write tool runs with the env basic auth; it needs no OAuth `write` scope."""
+def test_require_write_scope_noop_on_api_token_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """In stdio without a token file, a write tool runs with the env basic auth, unchecked."""
     shutil.copy(Path(server.__file__), tmp_path / "server.py")  # no real .env next to the copy
     monkeypatch.setenv("ACCESS_LEVEL", "management")
     spec = importlib.util.spec_from_file_location("server_management", tmp_path / "server.py")
