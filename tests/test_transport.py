@@ -5,11 +5,14 @@ The copy lives in a temp dir, so no real `.env` is loaded. HTTP is served throug
 """
 
 import ast
+import asyncio
 import base64
 import contextlib
+import importlib.metadata
 import importlib.util
 import itertools
 import json
+import logging
 import os
 import re
 import shutil
@@ -26,8 +29,10 @@ import anyio
 import httpx
 import pytest
 import uvicorn
-from mcp.server.fastmcp import FastMCP
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.client import Client
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
@@ -63,12 +68,12 @@ _module_ids = itertools.count()
 def load_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., ModuleType]:
     """Return a loader that imports a fresh server.py copy under the given env overrides.
 
-    Every `MCP_*` and `FASTMCP_*` var is cleared first. A `None` value deletes a var, and
+    Every `MCP_*` var is cleared first. A `None` value deletes a var, and
     `run_as_main=True` executes the copy as `__main__`.
     """
     shutil.copy(SERVER_FILE, tmp_path / "server.py")
     for name in list(os.environ):
-        if name.startswith(("MCP_", "FASTMCP_")):
+        if name.startswith("MCP_"):
             monkeypatch.delenv(name)
 
     def load(run_as_main: bool = False, **env: str | None) -> ModuleType:
@@ -126,7 +131,7 @@ def _zendesk_stub_client(
 
 
 def _tool_names(module: ModuleType) -> list[str]:
-    """Return the names of the tools registered on the module's FastMCP server."""
+    """Return the names of the tools registered on the module's MCP server."""
     return [tool.name for tool in anyio.run(module.mcp.list_tools)]
 
 
@@ -152,18 +157,18 @@ def _stub_zendesk(module: ModuleType, monkeypatch: pytest.MonkeyPatch) -> list[h
 
 
 def _record_launches(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
-    """Stub `FastMCP.run` and `uvicorn.run`, and return the list of launches they record."""
+    """Stub `MCPServer.run` and `uvicorn.run`, and return the list of launches they record."""
     launches: list[tuple] = []
 
-    def fake_mcp_run(self: FastMCP, transport: str = "stdio", **kwargs: object) -> None:
-        """Record a FastMCP launch instead of serving."""
+    def fake_mcp_run(self: MCPServer, transport: str = "stdio", **kwargs: object) -> None:
+        """Record an MCP server launch instead of serving."""
         launches.append(("mcp.run", transport))
 
     def fake_uvicorn_run(app: object, **kwargs: object) -> None:
         """Record a uvicorn launch instead of serving."""
         launches.append(("uvicorn.run", app, kwargs))
 
-    monkeypatch.setattr(FastMCP, "run", fake_mcp_run)
+    monkeypatch.setattr(MCPServer, "run", fake_mcp_run)
     monkeypatch.setattr(uvicorn, "run", fake_uvicorn_run)
     return launches
 
@@ -223,7 +228,11 @@ def test_http_mode_imports_without_zendesk_credentials(
 ) -> None:
     """HTTP mode imports without creds and is stateless with JSON responses."""
     module = _load_http(load_server, ZENDESK_EMAIL=None, ZENDESK_API_KEY=None)
-    assert module.mcp.settings.stateless_http and module.mcp.settings.json_response
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        response = _rpc(client, CLAUDE_CODE_PATH, "tools/list")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert "mcp-session-id" not in response.headers
 
 
 @pytest.mark.parametrize(
@@ -362,7 +371,9 @@ def test_build_http_app_requires_single_mcp_route(
     """_build_http_app fails loudly unless the SDK app has exactly one MCP route to replace."""
     module = _load_http(load_server)
     routes = [Route(CLAUDE_CODE_PATH, endpoint=module.app) for _ in range(route_count)]
-    monkeypatch.setattr(module.mcp, "streamable_http_app", lambda: Starlette(routes=routes))
+    monkeypatch.setattr(
+        module.mcp, "streamable_http_app", lambda **options: Starlette(routes=routes)
+    )
     with pytest.raises(RuntimeError, match="MCP route"):
         module._build_http_app()
 
@@ -424,7 +435,43 @@ def _add_probe_tools(module: ModuleType) -> None:
                 await anyio.sleep(0.01)
         return module._current_endpoint().value
 
-    for tool in (whoami, whoami_then_zendesk, whoami_in_worker, whoami_when_both_in):
+    def where_am_i() -> str:
+        """Return the endpoint and whether the tool body runs on the event loop's thread."""
+        try:
+            asyncio.get_running_loop()
+            on_event_loop = True
+        except RuntimeError:
+            on_event_loop = False
+        endpoint = module._current_endpoint().value
+        return json.dumps({"endpoint": endpoint, "on_event_loop": on_event_loop})
+
+    barrier = threading.Barrier(2, timeout=2)
+
+    def overlap() -> str:
+        """Wait until a second call is inside this tool too, then report this call's context."""
+        try:
+            barrier.wait()
+            overlapped = True
+        except threading.BrokenBarrierError:
+            overlapped = False
+        return json.dumps(
+            {
+                "overlapped": overlapped,
+                "endpoint": module._current_endpoint().value,
+                "has_deadline": module._call_deadline() is not None,
+                "user_id": module._caller_access_token().user_id,
+            }
+        )
+
+    probes = (
+        whoami,
+        whoami_then_zendesk,
+        whoami_in_worker,
+        whoami_when_both_in,
+        where_am_i,
+        overlap,
+    )
+    for tool in probes:
         module.mcp.add_tool(tool)
 
 
@@ -436,9 +483,9 @@ def _call(client: TestClient, path: str, name: str) -> tuple[bool, str]:
 
 async def _call_in_memory(module: ModuleType, name: str) -> tuple[bool, str]:
     """Call a tool through an in-memory (non-HTTP) session and return (isError, text)."""
-    async with create_connected_server_and_client_session(module.mcp) as session:
+    async with Client(module.mcp) as session:
         result = await session.call_tool(name, {})
-    return result.isError, result.content[0].text
+    return result.is_error, result.content[0].text
 
 
 def _transport_security(module: ModuleType) -> Callable[[str], Any]:
@@ -548,6 +595,339 @@ def test_current_endpoint_stdio(load_server: Callable[..., ModuleType]) -> None:
     assert module._current_endpoint() is module.Endpoint.STDIO
 
 
+# mcp 2.x: SDK version, worker threads, request context and tool errors
+
+MCP_PIN = "mcp[cli]>=2.0.0,<3.0.0"
+SECOND_CALLER_TOKEN = "second-caller-token-0123456789"
+
+
+def test_mcp_sdk_installed_is_2x() -> None:
+    """The installed mcp SDK is 2.x, the major version server.py is written for."""
+    assert importlib.metadata.version("mcp").split(".")[0] == "2"
+
+
+def test_mcp_pin_same_in_requirements_and_pyproject() -> None:
+    """requirements.txt and pyproject.toml pin the same mcp 2.x range."""
+    root = SERVER_FILE.parent
+    requirements = [
+        line.strip()
+        for line in (root / "requirements.txt").read_text().splitlines()
+        if line.strip().startswith("mcp")
+    ]
+    # A plain line scan: tomllib is not in the py3.10 standard library.
+    pyproject = [
+        line.strip().strip('",')
+        for line in (root / "pyproject.toml").read_text().splitlines()
+        if line.strip().startswith('"mcp')
+    ]
+    assert requirements == [MCP_PIN]
+    assert pyproject == [MCP_PIN]
+
+
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+def test_sync_tool_runs_off_event_loop_with_endpoint(
+    load_server: Callable[..., ModuleType], transport: str
+) -> None:
+    """A sync tool body runs on a worker thread, not the event loop, and still sees its endpoint."""
+    if transport == "http":
+        module = _load_http(load_server)
+        _add_probe_tools(module)
+        with TestClient(module.app, base_url=BASE_URL) as client:
+            is_error, text = _call(client, ZENDESK_FLOW_PATH, "where_am_i")
+        expected_endpoint = "zendesk_flow"
+    else:
+        module = load_server()
+        _add_probe_tools(module)
+        is_error, text = anyio.run(_call_in_memory, module, "where_am_i")
+        expected_endpoint = "stdio"
+    assert is_error is False, text
+    assert json.loads(text) == {"endpoint": expected_endpoint, "on_event_loop": False}
+
+
+def _two_caller_stub_client(module: ModuleType) -> httpx.Client:
+    """Build a stub Zendesk client: CALLER_TOKEN is user 42, SECOND_CALLER_TOKEN is user 43."""
+    users = {f"Bearer {CALLER_TOKEN}": 42, f"Bearer {SECOND_CALLER_TOKEN}": 43}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Answer a token check with the caller's user id; answer anything else with a ticket."""
+        if request.url.path.endswith("/oauth/tokens/current.json"):
+            user_id = users.get(request.headers.get("authorization"))
+            if user_id is None:
+                return httpx.Response(401, json={"error": "invalid_token"})
+            return httpx.Response(200, json={"token": {**TOKEN_INFO, "user_id": user_id}})
+        return httpx.Response(200, json={"ticket": {"id": 1}})
+
+    return httpx.Client(base_url=module.BASE_URL, transport=httpx.MockTransport(handler))
+
+
+def test_concurrent_sync_calls_keep_own_endpoint_and_caller(
+    load_server: Callable[..., ModuleType],
+) -> None:
+    """Two sync tool calls on different paths overlap, and each sees its own endpoint and caller."""
+    module = _load_http(load_server)
+    module._client = _two_caller_stub_client(module)
+    _add_probe_tools(module)
+
+    def call_overlap(client: TestClient, path: str, token: str) -> dict:
+        """Call the `overlap` probe tool on `path` as `token`, and return its JSON answer."""
+        params = {"name": "overlap", "arguments": {}}
+        response = _rpc(client, path, "tools/call", params, authorization=f"Bearer {token}")
+        result = response.json()["result"]
+        assert result["isError"] is False, result
+        return json.loads(result["content"][0]["text"])
+
+    with TestClient(module.app, base_url=BASE_URL) as client, ThreadPoolExecutor(2) as executor:
+        flow = executor.submit(call_overlap, client, ZENDESK_FLOW_PATH, CALLER_TOKEN)
+        claude = executor.submit(call_overlap, client, CLAUDE_CODE_PATH, SECOND_CALLER_TOKEN)
+        flow_answer = flow.result()
+        claude_answer = claude.result()
+    assert flow_answer == {
+        "overlapped": True,
+        "endpoint": "zendesk_flow",
+        "has_deadline": True,
+        "user_id": 42,
+    }
+    assert claude_answer == {
+        "overlapped": True,
+        "endpoint": "claude_code",
+        "has_deadline": False,
+        "user_id": 43,
+    }
+
+
+def test_build_http_app_passes_transport_options(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_build_http_app passes the stateless, JSON, path and Host/Origin options to the SDK app."""
+    module = _load_http(load_server, MCP_PUBLIC_URL="https://mcp.example.com")
+    server_class = type(module.mcp)
+    original = server_class.streamable_http_app
+    seen: list[dict[str, Any]] = []
+
+    def spy(self: Any, **kwargs: Any) -> Any:
+        """Record the keyword arguments, then build the SDK app as usual."""
+        seen.append(kwargs)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(server_class, "streamable_http_app", spy)
+    module._build_http_app()
+    assert len(seen) == 1
+    options = seen[0]
+    assert options.get("stateless_http") is True
+    assert options.get("json_response") is True
+    assert options.get("streamable_http_path") == CLAUDE_CODE_PATH
+    assert "mcp.example.com" in options["transport_security"].allowed_hosts
+
+
+def _raising_tool(name: str, error: BaseException, is_async: bool) -> Callable[[], Any]:
+    """Return a no-argument probe tool named `name` that raises `error`, sync or async."""
+    if is_async:
+
+        async def tool() -> str:
+            """Raise the probe's error from a coroutine."""
+            raise error
+
+    else:
+
+        def tool() -> str:
+            """Raise the probe's error."""
+            raise error
+
+    tool.__name__ = name
+    tool.__qualname__ = name
+    return tool
+
+
+def _tool_records(
+    caplog: pytest.LogCaptureFixture, *tool_names: str, level: int | None = logging.WARNING
+) -> list[logging.LogRecord]:
+    """Return the wrapper's records ("Tool <name> ...") for the given tools.
+
+    Only records at `level` are returned; `level=None` returns them at any level.
+    """
+    prefixes = tuple(f"Tool {name} " for name in tool_names)
+    return [
+        record
+        for record in caplog.records
+        if (level is None or record.levelno == level) and record.getMessage().startswith(prefixes)
+    ]
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_tool_failure_log_has_traceback_only_for_crashes(
+    load_server: Callable[..., ModuleType], caplog: pytest.LogCaptureFixture, is_async: bool
+) -> None:
+    """An expected error logs one WARNING line; a crash logs a WARNING with its traceback.
+
+    Both keep their exception text for the client, for sync and async tools alike.
+    """
+    module = load_server()
+    module.mcp.add_tool(_raising_tool("refuse_scope", PermissionError("no write scope"), is_async))
+    module.mcp.add_tool(_raising_tool("crash", KeyError("missing_field"), is_async))
+    with caplog.at_level(logging.WARNING):
+        refused = anyio.run(_call_in_memory, module, "refuse_scope")
+        crashed = anyio.run(_call_in_memory, module, "crash")
+    assert refused == (True, "Error executing tool refuse_scope: no write scope")
+    assert crashed[0] is True and "missing_field" in crashed[1]
+    ours = _tool_records(caplog, "refuse_scope", "crash")
+    assert len(ours) == 2, ours
+    by_tool = {record.getMessage().split()[1]: record for record in ours}
+    assert by_tool["refuse_scope"].exc_info is None
+    assert "PermissionError: no write scope" in by_tool["refuse_scope"].getMessage()
+    assert by_tool["crash"].exc_info is not None
+    assert by_tool["crash"].exc_info[0] is KeyError
+
+
+def _zendesk_404() -> httpx.HTTPStatusError:
+    """Return the HTTPStatusError httpx raises for a Zendesk 404 (its text has two lines)."""
+    request = httpx.Request("GET", "https://example.zendesk.com/api/v2/tickets/9.json")
+    response = httpx.Response(404, request=request)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        return error
+    raise AssertionError("raise_for_status did not raise for a 404")
+
+
+def _expected_error(module: ModuleType, case: str) -> Exception:
+    """Build one instance of an error the server treats as expected, named by `case`."""
+    request = httpx.Request("GET", "https://example.zendesk.com/api/v2/tickets/9.json")
+    if case == "http_status":
+        return _zendesk_404()
+    if case == "timeout":
+        return httpx.ReadTimeout("read timed out", request=request)
+    if case == "network":
+        return httpx.ConnectError("connection refused", request=request)
+    if case == "remote_protocol":
+        return httpx.RemoteProtocolError("Server disconnected", request=request)
+    if case == "proxy":
+        return httpx.ProxyError("proxy refused the tunnel", request=request)
+    if case == "permission":
+        return PermissionError("no write scope")
+    if case == "token_store":
+        return module.stdio_oauth.TokenStoreError("token file is unreadable")
+    if case == "deadline":
+        module.ZENDESK_FLOW_BUDGET_SECONDS = 25.0  # stdio has no budget; the message names one
+        return module._DeadlineReached(progressed=False)
+    if case == "call_refused":
+        return module._CallRefused("No authenticated caller for this request; refusing it.")
+    if case == "bad_tool_input":
+        return module._BadToolInput("comment must not be empty")
+    raise ValueError(f"unknown case {case}")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "http_status",
+        "timeout",
+        "network",
+        "remote_protocol",
+        "proxy",
+        "permission",
+        "token_store",
+        "deadline",
+        "call_refused",
+        "bad_tool_input",
+    ],
+)
+def test_expected_tool_errors_log_one_line_without_traceback(
+    load_server: Callable[..., ModuleType], caplog: pytest.LogCaptureFixture, case: str
+) -> None:
+    """Each kind of expected error logs one WARNING record with its type and no traceback."""
+    module = load_server()
+    error = _expected_error(module, case)
+    module.mcp.add_tool(_raising_tool("probe", error, is_async=False))
+    with caplog.at_level(logging.WARNING):
+        is_error, text = anyio.run(_call_in_memory, module, "probe")
+    assert is_error is True
+    assert text == f"Error executing tool probe: {error}"
+    ours = _tool_records(caplog, "probe")
+    assert len(ours) == 1, ours
+    assert ours[0].exc_info is None, case
+    assert type(error).__name__ in ours[0].getMessage()
+
+
+def test_expected_http_status_error_logs_a_single_line(
+    load_server: Callable[..., ModuleType], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A Zendesk HTTP error logs one line, though httpx puts a newline in its text."""
+    module = load_server()
+    error = _zendesk_404()
+    assert "\n" in str(error)
+    module.mcp.add_tool(_raising_tool("probe", error, is_async=False))
+    with caplog.at_level(logging.WARNING):
+        anyio.run(_call_in_memory, module, "probe")
+    ours = _tool_records(caplog, "probe")
+    assert len(ours) == 1, ours
+    message = ours[0].getMessage()
+    assert "\n" not in message
+    assert "404 Not Found" in message
+
+
+async def _protocol_error_in_memory(module: ModuleType, name: str) -> str:
+    """Call a tool in memory and return the message of the JSON-RPC error it raises.
+
+    The error is caught inside the session: the 2.x `Client` re-raises an error that escapes
+    its `async with` block as an exception group.
+    """
+    async with Client(module.mcp) as session:
+        try:
+            await session.call_tool(name, {})
+        except MCPError as error:
+            return str(error)
+    return "no protocol error"
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_tool_error_and_mcp_error_pass_through_unlogged(
+    load_server: Callable[..., ModuleType], caplog: pytest.LogCaptureFixture, is_async: bool
+) -> None:
+    """A ToolError keeps its text and an MCPError stays a JSON-RPC error; neither is logged."""
+    module = load_server()
+    tool_error = ToolError("deliberate refusal")
+    protocol_error = MCPError(code=-32602, message="bad request on purpose")
+    module.mcp.add_tool(_raising_tool("refuse", tool_error, is_async))
+    module.mcp.add_tool(_raising_tool("reject", protocol_error, is_async))
+    with caplog.at_level(logging.DEBUG):
+        refused = anyio.run(_call_in_memory, module, "refuse")
+        rejected = anyio.run(_protocol_error_in_memory, module, "reject")
+    assert refused == (True, "Error executing tool refuse: deliberate refusal")
+    assert rejected == "bad request on purpose"
+    assert _tool_records(caplog, "refuse", "reject", level=None) == []
+
+
+def test_remember_mcp_request_resets_after_call(load_server: Callable[..., ModuleType]) -> None:
+    """The middleware exposes the request only while its message is handled, even on failure."""
+    module = _load_http(load_server)
+    request = object()
+    context = types.SimpleNamespace(request=request)
+    seen: list[object] = []
+
+    async def handle(ctx: Any) -> str:
+        """Record the request the handler sees, and answer."""
+        seen.append(module._current_request())
+        return "handled"
+
+    async def fail(ctx: Any) -> str:
+        """Record the request the handler sees, then fail."""
+        seen.append(module._current_request())
+        raise ValueError("handler failed")
+
+    async def drive() -> list[object]:
+        """Run both handlers through the middleware in one task; return what each step saw."""
+        steps = [module._current_request()]
+        steps.append(await module._remember_mcp_request(context, handle))
+        steps.append(module._current_request())
+        with pytest.raises(ValueError, match="handler failed"):
+            await module._remember_mcp_request(context, fail)
+        steps.append(module._current_request())
+        return steps
+
+    assert anyio.run(drive) == [None, "handled", None, None]
+    assert seen == [request, request]
+
+
 @pytest.mark.parametrize(
     "url,hosts,origins",
     [
@@ -621,8 +1001,11 @@ def test_http_mode_rejects_bad_public_url(load_server: Callable[..., ModuleType]
 def test_public_url_empty_means_unset(load_server: Callable[..., ModuleType]) -> None:
     """An empty MCP_PUBLIC_URL is treated as unset: the server loads with loopback entries only."""
     module = _load_http(load_server, MCP_PUBLIC_URL="")
-    loopback_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-    assert module.mcp.settings.transport_security.allowed_hosts == loopback_hosts
+    with TestClient(module.app, base_url=BASE_URL) as client:
+        loopback = _rpc(client, CLAUDE_CODE_PATH, "tools/list", host="localhost:8000")
+        public = _rpc(client, CLAUDE_CODE_PATH, "tools/list", host="mcp.example.com")
+    assert loopback.status_code == 200
+    assert public.status_code == 421
 
 
 def test_stdio_ignores_public_url(load_server: Callable[..., ModuleType]) -> None:
@@ -875,9 +1258,9 @@ def test_http_zendesk_auth_fails_closed_without_caller(
 
 async def _call_in_memory_args(module: ModuleType, name: str, args: dict) -> tuple[bool, str]:
     """Call a tool with arguments through an in-memory (non-HTTP) session."""
-    async with create_connected_server_and_client_session(module.mcp) as session:
+    async with Client(module.mcp) as session:
         result = await session.call_tool(name, args)
-    return result.isError, result.content[0].text
+    return result.is_error, result.content[0].text
 
 
 def test_http_bulk_comments_send_caller_token(
@@ -1584,9 +1967,9 @@ def test_cursor_param_is_http_only(load_server: Callable[..., ModuleType]) -> No
         "export_search_results": ["query", "max_results"],
     }
     for name, params in stdio_params.items():
-        assert "cursor" in http[name].inputSchema["properties"], name
+        assert "cursor" in http[name].input_schema["properties"], name
         assert "next_cursor" in http[name].description, name
-        assert list(stdio[name].inputSchema["properties"]) == params, name
+        assert list(stdio[name].input_schema["properties"]) == params, name
         assert stdio[name].description == getattr(stdio_module, name).__doc__, name
 
 
@@ -2430,3 +2813,58 @@ def test_stdio_export_ticket_comments_writes_whole_thread(
     is_error, text = anyio.run(_call_in_memory_args, module, "export_ticket_comments", arguments)
     assert is_error is False and _json_object(text)["comment_count"] == 6
     assert _ids(json.loads(output.read_text())) == [11, 12, 21, 22, 31, 32]
+
+
+def test_export_ticket_comments_replaces_file_atomically(
+    load_server: Callable[..., ModuleType], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """export_ticket_comments replaces an existing file whole, as mode 0600, and reports the bytes
+    it wrote. A failed replace leaves the old file in place and no temp file behind."""
+    module = load_server()
+    clock = _with_clock(module, monkeypatch)
+    _slow_zendesk(module, clock, _paged("comments", pages=2, latency=0.0))
+    output = tmp_path / "exports" / "thread.json"
+    output.parent.mkdir()
+    output.write_text("x" * 10_000)  # longer than the export, so a partial overwrite would show
+    output.chmod(0o644)
+
+    result = json.loads(module.export_ticket_comments(7, str(output)))
+    written = output.read_bytes()
+    assert _ids(json.loads(written)) == [11, 12, 21, 22]
+    assert result["bytes"] == len(written)
+    assert list(output.parent.iterdir()) == [output]
+    assert output.stat().st_mode & 0o777 == 0o600
+
+    def failing_replace(source: str, destination: str) -> None:
+        """Fail the way a full or read-only file system would."""
+        raise OSError("replace failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", failing_replace)
+        with pytest.raises(OSError, match="replace failed"):
+            module.export_ticket_comments(8, str(output))
+    assert output.read_bytes() == written
+    assert list(output.parent.iterdir()) == [output]
+
+
+def test_write_file_atomically_concurrent_same_path(
+    load_server: Callable[..., ModuleType], tmp_path: Path
+) -> None:
+    """Two threads writing one path at once leave one writer's whole file, never a mix."""
+    module = load_server()
+    output = tmp_path / "exports" / "thread.json"
+    output.parent.mkdir()
+    texts = [json.dumps([{"writer": writer}] * 20_000 * (writer + 1)) for writer in (0, 1)]
+    barrier = threading.Barrier(2, timeout=5)
+
+    def write_many(text: str) -> list[int]:
+        """Wait for the other writer, then write `text` repeatedly; return the byte counts."""
+        barrier.wait()
+        return [module._write_file_atomically(output, text) for _ in range(20)]
+
+    with ThreadPoolExecutor(2) as executor:
+        byte_counts = list(executor.map(write_many, texts))
+
+    assert byte_counts == [[len(text.encode("utf-8"))] * 20 for text in texts]
+    assert output.read_text() in texts
+    assert list(output.parent.iterdir()) == [output]

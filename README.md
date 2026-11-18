@@ -239,7 +239,7 @@ Zendesk stops each tool call after 30 seconds, so calls on `/zendesk/mcp` get a 
 - `get_comments_for_tickets` returns `unfinished` (ticket ID → cursor); finish each with `get_ticket_comments`. `search_articles` and `list_content_tags` return a partial list marked "may be incomplete", with no cursor. `fetch_attachment` returns `kind: stopped_by_time_budget`.
 - **Single reads** fail with an error that names the budget.
 - **Writes** are never cut once sent. A write is not started with under 5 s left; the error says nothing was sent and no change was made. A budget under about 6 s therefore refuses every write.
-- **Limits:** the bound is soft. No request starts with under 1 s left and each request's timeout is capped at the time left, so a call ends by about the budget; a Zendesk response that stalls mid-body can stretch it to about twice the budget. The server runs tools on its event loop, so a request that waits behind another call is not handled (or timed) until that call returns.
+- **Limits:** the bound is soft. No request starts with under 1 s left and each request's timeout is capped at the time left, so a call ends by about the budget; a Zendesk response that stalls mid-body can stretch it to about twice the budget. Tools run on worker threads, up to 40 at once per server process (the anyio default), so calls do not wait for each other. The token check uses the same 40 threads. A call that arrives when all 40 are busy waits for a free thread, and that wait counts against its budget.
 
 ## Troubleshooting
 
@@ -293,7 +293,7 @@ git pull
 .venv/bin/pip install -r requirements.txt
 ```
 
-Then restart Claude Code. If you still use an API token, see [Signing in](#signing-in) > Existing users.
+Then restart Claude Code. This update moves to mcp 2.x; if `import server` fails with `No module named 'mcp.server.mcpserver'`, rerun the pip step. If you still use an API token, see [Signing in](#signing-in) > Existing users.
 
 ## Development
 

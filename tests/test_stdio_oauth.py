@@ -1130,3 +1130,36 @@ def test_refresh_omits_empty_scope(token_dir: Path) -> None:
     assert len(endpoint.requests) == 1
     # The raw body: a form parser would drop an empty `scope=` and hide it.
     assert b"scope" not in endpoint.requests[0].content
+
+
+def test_one_store_shared_by_threads_refreshes_once(token_dir: Path) -> None:
+    """Eight threads share ONE store at expiry and send exactly one refresh.
+
+    Under mcp 2.x, stdio tools run on worker threads that share the server's single store. A second
+    refresh would end the sign-in, because refresh tokens are single-use.
+    """
+    write_token_file(token_dir, access_token_expires_at=START + 60)
+    endpoint = TokenEndpoint(delay_seconds=0.2)
+    store = make_store(token_dir, endpoint)
+    thread_count = 8
+    barrier = threading.Barrier(thread_count, timeout=10)
+    results: list[str] = []
+    results_lock = threading.Lock()
+
+    def get_token_at_once() -> None:
+        """Wait for every thread, then read the access token."""
+        barrier.wait()
+        token = store.get_access_token()
+        with results_lock:
+            results.append(token)
+
+    threads = [threading.Thread(target=get_token_at_once) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert results == ["access-2"] * thread_count
+    assert len(endpoint.requests) == 1
+    assert endpoint.invalid_grants == 0

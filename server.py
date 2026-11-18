@@ -38,15 +38,20 @@ reads fail with an error; a write is never cut, but is refused with under 5 s le
 """
 
 import base64
+import contextlib
+import contextvars
 import enum
+import functools
 import hashlib
 import inspect
 import json
+import logging
 import math
 import mimetypes
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -59,13 +64,17 @@ from urllib.parse import parse_qsl, unquote_plus, urlparse, urlsplit
 
 import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
 
 import stdio_oauth
 
 if TYPE_CHECKING:
     from mcp.server.auth.provider import AccessToken
+    from mcp.server.context import CallNext, ServerRequestContext
     from mcp.server.transport_security import TransportSecuritySettings
+    from starlette.requests import Request
 
 # Load .env from the same directory as this script
 load_dotenv(Path(__file__).parent / ".env")
@@ -240,10 +249,10 @@ def _transport_security(public_url: str) -> "TransportSecuritySettings":
     Raises:
         ValueError: `public_url` is set but malformed.
     """
-    # Imported here so stdio keeps importing on an older mcp that lacks this module.
+    # Imported here because only HTTP mode needs it.
     from mcp.server.transport_security import TransportSecuritySettings
 
-    # Passing any settings turns off FastMCP's localhost defaults, so list loopback explicitly.
+    # Passing any settings turns off the SDK's localhost defaults, so list loopback explicitly.
     allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
     allowed_origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
     if public_url:
@@ -254,11 +263,11 @@ def _transport_security(public_url: str) -> "TransportSecuritySettings":
 
 
 def _http_settings() -> dict[str, Any]:
-    """Read and validate the HTTP-mode settings passed to FastMCP.
+    """Read and validate the HTTP-mode settings passed to `streamable_http_app()` and uvicorn.
 
     Returns:
-        FastMCP keyword arguments `host`, `port` and `transport_security` (loopback plus the
-        MCP_PUBLIC_URL host), and `resource_base_url`, which the caller removes before FastMCP.
+        `host`, `port` and `transport_security` (loopback plus the MCP_PUBLIC_URL host), and
+        `resource_base_url`, which the caller removes.
 
     Raises:
         ValueError: MCP_PORT is not a port number, or MCP_PUBLIC_URL fails the checks in
@@ -303,48 +312,169 @@ def _flow_budget_seconds() -> float:
     return budget
 
 
+_logger = logging.getLogger(__name__)
+
+# The HTTP request of the MCP message being handled. None in stdio and outside a request.
+_mcp_request: "contextvars.ContextVar[Request | None]" = contextvars.ContextVar(
+    "_mcp_request", default=None
+)
+
+
+async def _remember_mcp_request(
+    ctx: "ServerRequestContext[Any, Any]", call_next: "CallNext"
+) -> Any:
+    """Server middleware: record the HTTP request of the MCP message for `_current_request()`.
+
+    mcp 2.x has no ambient request context, so this copies `ctx.request` into `_mcp_request`
+    for the length of the message. The SDK runs a sync tool with `anyio.to_thread.run_sync`,
+    which copies the current context into the tool's thread, so the tool sees the value set
+    here. A ThreadPoolExecutor worker gets no copy, so callers still resolve the endpoint, auth
+    and deadline at tool entry and pass them down. Registered in HTTP mode only: stdio never
+    reads the request, so it does not depend on the SDK's provisional middleware API.
+
+    Args:
+        ctx: The SDK's context for the message; `ctx.request` is the Starlette request.
+        call_next: The rest of the middleware chain and the handler.
+
+    Returns:
+        The handler's result, unchanged.
+    """
+    token = _mcp_request.set(ctx.request)
+    try:
+        return await call_next(ctx)
+    finally:
+        _mcp_request.reset(token)
+
+
+def _current_request() -> "Request | None":
+    """Return the Starlette request of the MCP message being handled.
+
+    Returns:
+        The request, or None in stdio, outside a request, and in a ThreadPoolExecutor worker.
+    """
+    return _mcp_request.get()
+
+
+def _log_tool_failure(tool_name: str, error: Exception) -> None:
+    """Log a failed tool call to stderr at WARNING.
+
+    An expected error (`_EXPECTED_TOOL_ERRORS`: Zendesk or network errors, refusals, sign-in
+    problems) is one line with the tool, exception type and message; line breaks in the message
+    (httpx puts one in every HTTP status error) become spaces. Anything else is a crash and is
+    logged with its full traceback.
+
+    Args:
+        tool_name: The tool that failed.
+        error: The exception it raised.
+    """
+    if isinstance(error, _EXPECTED_TOOL_ERRORS):
+        message = " ".join(str(error).splitlines())
+        _logger.warning("Tool %s error: %s: %s", tool_name, type(error).__name__, message)
+        return
+    _logger.warning("Tool %s failed", tool_name, exc_info=error)
+
+
+def _keep_error_text(fn: Callable) -> Callable:
+    """Wrap a tool so that its exception text reaches the client, as it did under mcp 1.x.
+
+    From mcp 2.1.0 the SDK replaces the text of any exception other than `ToolError` with a
+    bare "Error executing tool <name>". This deliberately undoes that, so the user still sees
+    "sign in again", "no `write` scope", "Cannot tell which endpoint" and Zendesk's errors as
+    `Error executing tool <name>: <text>` (the format the README's Troubleshooting documents).
+    Any other exception is logged by `_log_tool_failure` and re-raised as a `ToolError`.
+    `ToolError` and `MCPError` pass through unchanged and unlogged. The SDK adds its own
+    one-line INFO record for every failed call.
+
+    Args:
+        fn: The tool function, sync or async.
+
+    Returns:
+        A wrapper with `fn`'s name, signature and docstring; async when `fn` is.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await fn(*args, **kwargs)
+            except (ToolError, MCPError):
+                raise
+            except Exception as error:
+                _log_tool_failure(fn.__name__, error)
+                raise ToolError(str(error)) from error
+
+        return async_wrapper
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except (ToolError, MCPError):
+            raise
+        except Exception as error:
+            _log_tool_failure(fn.__name__, error)
+            raise ToolError(str(error)) from error
+
+    return wrapper
+
+
+class _ZendeskServer(MCPServer):
+    """The SDK's `MCPServer`, with every tool wrapped by `_keep_error_text`."""
+
+    def add_tool(self, fn: Callable, *args: Any, **kwargs: Any) -> None:
+        """Register `fn` as a tool, wrapped so its exception text reaches the client.
+
+        `MCPServer.tool()` registers through this method too, and still returns the unwrapped
+        function.
+
+        Args:
+            fn: The tool function.
+            *args: Passed on to `MCPServer.add_tool`.
+            **kwargs: Passed on to `MCPServer.add_tool`.
+        """
+        super().add_tool(_keep_error_text(fn), *args, **kwargs)
+
+
+mcp = _ZendeskServer("zendesk", middleware=[] if TRANSPORT == "stdio" else [_remember_mcp_request])
 if TRANSPORT == "stdio":
-    mcp = FastMCP("zendesk")
     ZENDESK_FLOW_BUDGET_SECONDS: float | None = None
 else:
     _http_config = _http_settings()
     RESOURCE_BASE_URL: str = _http_config.pop("resource_base_url")
     ZENDESK_FLOW_BUDGET_SECONDS = _flow_budget_seconds()
-    mcp = FastMCP(
-        "zendesk",
-        stateless_http=True,
-        json_response=True,
-        streamable_http_path=CLAUDE_CODE_PATH,
-        **_http_config,
-    )
 
 
 def _current_endpoint() -> Endpoint:
     """Return the endpoint the current tool call came from.
 
-    Call it in the tool's own thread, at tool entry, and pass the value down: the MCP request
-    context is a contextvar, which does not reach ThreadPoolExecutor workers. It also works
-    inside other MCP request handlers, such as tools/list.
+    Call it in the tool's own thread, at tool entry, and pass the value down: the request is
+    kept in a contextvar (see `_remember_mcp_request`), which does not reach ThreadPoolExecutor
+    workers. It also works inside other MCP request handlers, such as tools/list.
 
     Returns:
         Endpoint.STDIO in stdio mode (any thread, inside or outside a request); otherwise the
         Endpoint recorded by the HTTP route that received the request.
 
     Raises:
-        RuntimeError: HTTP mode, and the call has no HTTP request or its route did not record a
+        _CallRefused: HTTP mode, and the call has no HTTP request or its route did not record a
             known endpoint (including when called from a ThreadPoolExecutor worker). Never
-            guesses.
+            guesses. A `RuntimeError` subclass.
     """
     if TRANSPORT == "stdio":
         return Endpoint.STDIO
-    try:
-        request = mcp.get_context().request_context.request
-    except ValueError:  # no MCP request in this thread
-        request = None
+    request = _current_request()
     endpoint = None if request is None else request.scope.get(_ENDPOINT_SCOPE_KEY)
     if endpoint not in _HTTP_ENDPOINTS:
-        raise RuntimeError("Cannot tell which endpoint this tool call came from; refusing it.")
+        raise _CallRefused("Cannot tell which endpoint this tool call came from; refusing it.")
     return endpoint
+
+
+class _CallRefused(RuntimeError):
+    """A tool call was refused because its endpoint or caller is unknown (not a crash)."""
+
+
+class _BadToolInput(ValueError):
+    """A tool refused its arguments (not a crash)."""
 
 
 class _DeadlineReached(Exception):
@@ -375,6 +505,22 @@ class _DeadlineReached(Exception):
         self.progressed = progressed
         self.partial = partial
         self.next_cursor = next_cursor
+
+
+# Failures a tool reports on purpose, or that come from Zendesk or the network. The error-text
+# wrapper logs these as one line; anything else is a crash and is logged with its traceback.
+_EXPECTED_TOOL_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.HTTPStatusError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+    httpx.ProxyError,
+    PermissionError,
+    stdio_oauth.TokenStoreError,
+    _DeadlineReached,
+    _CallRefused,
+    _BadToolInput,
+)
 
 
 # Query keys Zendesk puts in a ticket comments/audits `next_page` link; a cursor may carry only these.
@@ -524,13 +670,13 @@ def _call_deadline() -> float | None:
         None in stdio mode and on /claude/mcp; otherwise the deadline.
 
     Raises:
-        RuntimeError: HTTP mode, and the endpoint cannot be resolved (see `_current_endpoint`).
+        _CallRefused: HTTP mode, and the endpoint cannot be resolved (see `_current_endpoint`).
     """
     if TRANSPORT == "stdio":
         return None
     if _current_endpoint() is not Endpoint.ZENDESK_FLOW:
         return None
-    request = mcp.get_context().request_context.request
+    request = _current_request()
     return request.scope[_REQUEST_START_SCOPE_KEY] + ZENDESK_FLOW_BUDGET_SECONDS
 
 
@@ -840,26 +986,24 @@ def _caller_access_token() -> "AccessToken":
     """Return the verified OAuth token of the HTTP request being served.
 
     Reads the user that the auth middleware stored in the ASGI scope, which reaches the tool
-    through the MCP request context. Call it in the tool's own thread: worker threads have no
-    request context. The SDK's `get_access_token()` returns None here, because this server does
-    not install `AuthContextMiddleware`.
+    through `_current_request()`. Call it in the tool's own thread: ThreadPoolExecutor workers
+    have no request context. The SDK's `get_access_token()` returns None here, because this
+    server does not install `AuthContextMiddleware`.
 
     Returns:
         The caller's verified access token (its `token` and `scopes`).
 
     Raises:
-        RuntimeError: No HTTP request, or the request has no authenticated user.
+        _CallRefused: No HTTP request, or the request has no authenticated user. A
+            `RuntimeError` subclass.
     """
     from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 
-    try:
-        request = mcp.get_context().request_context.request
-    except ValueError:  # no MCP request in this thread
-        request = None
+    request = _current_request()
     user = None if request is None else request.scope.get("user")
     if isinstance(user, AuthenticatedUser):
         return user.access_token
-    raise RuntimeError("No authenticated caller for this request; refusing it.")
+    raise _CallRefused("No authenticated caller for this request; refusing it.")
 
 
 def _require_write_scope() -> None:
@@ -872,7 +1016,7 @@ def _require_write_scope() -> None:
     Raises:
         PermissionError: The token's scopes do not include `write` (HTTP mode, or stdio with a
             read-only sign-in).
-        RuntimeError: HTTP mode, and the call has no authenticated caller.
+        _CallRefused: HTTP mode, and the call has no authenticated caller.
         LoginRequiredError: Stdio, and the token file is for another subdomain or client.
         TokenStoreError: Stdio, and the token file is unusable.
         OSError: Stdio, and the token file or directory could not be read.
@@ -903,7 +1047,7 @@ def _zendesk_auth() -> ZendeskAuth:
         token as bearer auth; HTTP mode never uses the API-token credentials.
 
     Raises:
-        RuntimeError: HTTP mode, and the call has no authenticated caller (including a worker
+        _CallRefused: HTTP mode, and the call has no authenticated caller (including a worker
             thread). No request is sent.
         LoginRequiredError: Stdio, and the user must sign in (again).
         TokenRefreshError: Stdio, and refreshing an expiring token failed.
@@ -1686,6 +1830,44 @@ def get_ticket_comments(ticket_id: int, cursor: str | None = None) -> str:
     return json.dumps(comments, indent=2)
 
 
+def _write_file_atomically(path: Path, text: str) -> int:
+    """Write `text` to `path` through a temp file in the same directory and `os.replace`.
+
+    Tools can run at the same time, so two exports to one path must never interleave. Readers
+    never see a partial file: they see the old file or the new one. There is no fsync, so this
+    is not a guarantee against a crash or power loss. The temp file is created by
+    `tempfile.mkstemp`, so the file ends up with mode 0600. Its name has a short fixed prefix,
+    so a target name near the file system's length limit still works.
+
+    Args:
+        path: The file to write. Its directory must exist.
+        text: The content, written as UTF-8.
+
+    Returns:
+        The number of bytes written.
+
+    Raises:
+        OSError: The write or the replace failed; the temp file is removed and `path` is
+            unchanged.
+    """
+    data = text.encode("utf-8")
+    fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=".export-", suffix=".tmp")
+    temp_file = None
+    try:
+        temp_file = os.fdopen(fd, "wb")
+        with temp_file:
+            temp_file.write(data)
+        os.replace(temp_name, path)
+    except BaseException:
+        if temp_file is None:  # os.fdopen failed, so the descriptor may still be open
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp_name)
+        raise
+    return len(data)
+
+
 @_stdio_only_tool()
 def export_ticket_comments(ticket_id: int, output_path: str) -> str:
     """Write all comments on a ticket to a local JSON file instead of returning them.
@@ -1694,9 +1876,10 @@ def export_ticket_comments(ticket_id: int, output_path: str) -> str:
     ticket that has accumulated thousands of notices), then process the file
     with a script rather than reading it into context. The file holds a
     compact JSON array in the same per-comment shape as `get_ticket_comments`.
-    An existing file at `output_path` is overwritten; parent directories are
-    created. Retries 429s with Retry-After backoff. Refuses an output_path in
-    the Zendesk token directory.
+    An existing file at `output_path` is replaced; parent directories are
+    created. The file is written with mode 0600 (owner read/write only).
+    Retries 429s with Retry-After backoff. Refuses an output_path in the
+    Zendesk token directory.
 
     Args:
         ticket_id: The Zendesk ticket ID.
@@ -1714,8 +1897,8 @@ def export_ticket_comments(ticket_id: int, output_path: str) -> str:
         return json.dumps({"error": error})
     comments = _fetch_comments(ticket_id, max_bytes=None, deadline=None)  # stdio only
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    resolved.write_text(json.dumps(comments))
-    result = {"path": str(path), "comment_count": len(comments), "bytes": resolved.stat().st_size}
+    written = _write_file_atomically(resolved, json.dumps(comments))
+    result = {"path": str(path), "comment_count": len(comments), "bytes": written}
     return json.dumps(result, indent=2)
 
 
@@ -2690,11 +2873,12 @@ def _resolve_attachment_paths(file_paths: list[str]) -> list[Path]:
         Resolved paths, in the order given.
 
     Raises:
-        ValueError: If no paths are given, or any path is in the Zendesk token
-            directory, missing, not a regular file, or larger than the attachment limit.
+        _BadToolInput: If no paths are given, or any path is in the Zendesk token
+            directory, missing, not a regular file, or larger than the attachment limit. A
+            `ValueError` subclass.
     """
     if not file_paths:
-        raise ValueError("file_paths must contain at least one path.")
+        raise _BadToolInput("file_paths must contain at least one path.")
     resolved: list[Path] = []
     problems: list[str] = []
     for raw_path in file_paths:
@@ -2711,7 +2895,7 @@ def _resolve_attachment_paths(file_paths: list[str]) -> list[Path]:
             continue
         resolved.append(path)
     if problems:
-        raise ValueError("Nothing was uploaded. " + "; ".join(problems))
+        raise _BadToolInput("Nothing was uploaded. " + "; ".join(problems))
     return resolved
 
 
@@ -2919,7 +3103,7 @@ if ACCESS_LEVEL in ("management", "admin"):
         """
         _require_write_scope()
         if not comment.strip():
-            raise ValueError("comment must not be empty; Zendesk attaches files via a comment.")
+            raise _BadToolInput("comment must not be empty; Zendesk attaches files via a comment.")
         files = _resolve_attachment_paths(file_paths)
 
         tokens: list[str] = []
@@ -3469,7 +3653,7 @@ if TRANSPORT == "streamable-http":
         """Build the ASGI app with the MCP endpoint served at both endpoint paths.
 
         Returns:
-            The FastMCP Starlette app, with its single MCP route replaced by two routes that
+            The SDK's Starlette app, with its single MCP route replaced by two routes that
             share the same transport endpoint and session manager. Each route is wrapped by
             `_require_caller_auth`, so it answers 401 without a valid Zendesk token, and then
             by `_EndpointTag` on the outside, so the recorded arrival time includes the token
@@ -3479,8 +3663,14 @@ if TRANSPORT == "streamable-http":
         Raises:
             RuntimeError: The SDK app does not have exactly one MCP route to replace.
         """
-        http_app = mcp.streamable_http_app()
-        mcp_path = mcp.settings.streamable_http_path
+        http_app = mcp.streamable_http_app(
+            streamable_http_path=CLAUDE_CODE_PATH,
+            stateless_http=True,
+            json_response=True,
+            transport_security=_http_config["transport_security"],
+            host=_http_config["host"],
+        )
+        mcp_path = CLAUDE_CODE_PATH
         matches = [
             index
             for index, route in enumerate(http_app.router.routes)
@@ -3580,4 +3770,4 @@ if __name__ == "__main__":
         import uvicorn
 
         # Pass the app object: an import string would import this module a second time.
-        uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
+        uvicorn.run(app, host=_http_config["host"], port=_http_config["port"])
