@@ -18,7 +18,7 @@ from types import ModuleType
 import anyio
 import httpx
 import pytest
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.client import Client
 
 import server
 
@@ -291,9 +291,9 @@ def test_post_upload_sends_upload_timeout(sent_requests: list[httpx.Request]) ->
 
 async def _call_tool_in_memory(module: ModuleType, name: str, arguments: dict) -> tuple[bool, str]:
     """Call a tool through an in-memory MCP session and return (isError, first text content)."""
-    async with create_connected_server_and_client_session(module.mcp) as session:
+    async with Client(module.mcp) as session:
         result = await session.call_tool(name, arguments)
-    return result.isError, result.content[0].text
+    return result.is_error, result.content[0].text
 
 
 def test_require_write_scope_noop_on_api_token_fallback(

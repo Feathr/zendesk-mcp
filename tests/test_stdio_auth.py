@@ -29,7 +29,7 @@ from urllib.parse import parse_qsl
 import anyio
 import httpx
 import pytest
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.client import Client
 
 import server
 import stdio_oauth
@@ -241,13 +241,13 @@ def use_oauth(
 def load_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **env: str | None) -> ModuleType:
     """Import a fresh copy of server.py (no `.env` next to it) under the given env overrides.
 
-    Every `MCP_*` and `FASTMCP_*` var is cleared first; a `None` value deletes a var.
+    Every `MCP_*` var is cleared first; a `None` value deletes a var.
     """
     copy_dir = tmp_path / f"server_copy_{next(_module_ids)}"
     copy_dir.mkdir()
     shutil.copy(SERVER_FILE, copy_dir / "server.py")
     for name in list(os.environ):
-        if name.startswith(("MCP_", "FASTMCP_")):
+        if name.startswith("MCP_"):
             monkeypatch.delenv(name)
     for name, value in env.items():
         if value is None:
@@ -267,9 +267,9 @@ def load_management(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ModuleTy
 
 async def _call_tool_in_memory(module: ModuleType, name: str, arguments: dict) -> tuple[bool, str]:
     """Call a tool through an in-memory MCP session and return (isError, first text content)."""
-    async with create_connected_server_and_client_session(module.mcp) as session:
+    async with Client(module.mcp) as session:
         result = await session.call_tool(name, arguments)
-    return result.isError, result.content[0].text
+    return result.is_error, result.content[0].text
 
 
 def call_tool(module: ModuleType, name: str, arguments: dict) -> tuple[bool, str]:

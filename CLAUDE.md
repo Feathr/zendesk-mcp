@@ -8,16 +8,16 @@ Adapted from anhinga's coding guidelines where relevant to a small MCP server.
 **NEVER install packages globally.** No bare `pip install`, `npm install -g`, etc. Use a
 virtualenv or `uv`/`uvx`.
 
-**Keep the `mcp` dependency pinned below 2.0.0.** The pin in `pyproject.toml`
-(`mcp[cli]>=1.27,<2.0.0`) is intentional; do not loosen it without explicit discussion.
+**Keep the `mcp` dependency on 2.x.** The pin (`mcp[cli]>=2.0.0,<3.0.0`) is intentional; do not
+change the major version without explicit discussion.
 
 **Never commit directly to `main`.** Branch first. Commit/push only when asked.
 
 ## Repository Overview
 
 **zendesk-mcp** is an MCP server in `server.py` exposing Zendesk tools over stdio, built on
-`FastMCP` and `httpx`, plus `stdio_oauth.py`: the stdio user's OAuth token store. It adds no
-tools, never imports `server`, and reads no env vars. `stdio_login.py` is the stdio user's
+the SDK's `MCPServer` and `httpx`, plus `stdio_oauth.py`: the stdio user's OAuth token store. It
+adds no tools, never imports `server`, and reads no env vars. `stdio_login.py` is the stdio user's
 one-time sign-in, run by hand in a terminal (`.venv/bin/python stdio_login.py`). It reads `.env`
 itself (`ZENDESK_SUBDOMAIN`, `ACCESS_LEVEL`, `ZENDESK_STDIO_OAUTH_CLIENT_ID`). It never imports
 `server` or `mcp`, and only its tests import it.
@@ -77,13 +77,22 @@ with these priorities:
 ## Type Annotations
 
 - Type all parameters, return values, and non-obvious variables.
-- Tool parameter annotations are load-bearing: FastMCP derives the tool's input schema from
+- Tool parameter annotations are load-bearing: the SDK derives the tool's input schema from
   them. An untyped or wrongly typed parameter ships a broken schema to every client.
 
 ## MCP Tool Conventions
 
 These are the repo-specific rules that matter most in review:
 
+- **Sync tools run on SDK worker threads, several at once (stdio too).** Read the request only
+  through `_current_request()` / `_current_endpoint()` / `_zendesk_auth()` / `_call_deadline()`
+  in the tool's own thread, and pass the values to any ThreadPoolExecutor worker. Keep module
+  state immutable or locked.
+- **An exception's text reaches the client because `_ZendeskServer.add_tool` turns it into a
+  `ToolError`;** do not register tools any other way. The wrapper logs to stderr: one WARNING
+  line for an expected error (`_EXPECTED_TOOL_ERRORS`), the full traceback for anything else. A
+  new deliberate refusal should raise a type in that tuple (or `ToolError`), so it does not log
+  as a crash.
 - **Tool docstrings are the product.** The docstring on an `@mcp.tool()` function is the
   tool description an LLM client reads to decide when and how to call it. It must state
   what the tool does, document every arg (Google-style `Args:` section), and mention
